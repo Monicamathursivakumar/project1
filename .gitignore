@@ -1,0 +1,11 @@
+backend/.env
+backend/**/__pycache__/
+backend/.venv/
+backend/venv/
+backend/private_uploads/
+backend/vaulttrace.db
+backend/.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+*.py[cod]
