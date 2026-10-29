@@ -24,15 +24,9 @@ services:
       - key: UPLOAD_DIR
         value: /tmp/private_uploads
       - key: CORS_ORIGINS
-        fromService:
-          type: web
-          name: vaulttrace-web
-          property: host
+        value: https://vaulttrace-web.onrender.com
       - key: FRONTEND_BASE_URL
-        fromService:
-          type: web
-          name: vaulttrace-web
-          property: host
+        value: https://vaulttrace-web.onrender.com
       - key: APP_ENVIRONMENT
         value: demo
 
