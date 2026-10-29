@@ -27,12 +27,12 @@ services:
         fromService:
           type: web
           name: vaulttrace-web
-          property: url
+          property: host
       - key: FRONTEND_BASE_URL
         fromService:
           type: web
           name: vaulttrace-web
-          property: url
+          property: host
       - key: APP_ENVIRONMENT
         value: demo
 
