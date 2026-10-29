@@ -2,6 +2,10 @@
 
 VaultTrace is a registry and controlled workflow for institutions, fixed deposit receipts (FDRs), evidence and release approvals. It is not an official government portal.
 
+The public home page introduces VaultTrace's record, verification and approval
+workflows. Visitors can sign in or request an account; protected application
+views continue to use the existing authentication and role checks.
+
 ## Local startup
 
 ### Backend (SQLite)

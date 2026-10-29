@@ -70,6 +70,13 @@ function discrepancyIdFromLocation(): number | null {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
+function publicScreenFromLocation(): "landing" | "auth" {
+  const params = new URLSearchParams(window.location.search);
+  return ["auth", "page", "verifyEmail", "resetPassword", "registrationId"].some((key) => params.has(key))
+    ? "auth"
+    : "landing";
+}
+
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   const paths: Record<string, string> = {
     grid: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
@@ -211,6 +218,7 @@ function StatusBadge({ value }: { value?: string }) {
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [page, setPageState] = useState<Page>(pageFromLocation);
+  const [publicScreen, setPublicScreen] = useState<"landing" | "auth">(publicScreenFromLocation);
   const [selectedDiscrepancyFdrId, setSelectedDiscrepancyFdrId] = useState<number | null>(discrepancyIdFromLocation);
   const [selectedInstrument, setSelectedInstrument] = useState<number | null>(null);
   const [booting, setBooting] = useState(true);
@@ -247,6 +255,7 @@ function App() {
     const syncLocation = () => {
       setPageState(pageFromLocation());
       setSelectedDiscrepancyFdrId(discrepancyIdFromLocation());
+      setPublicScreen(publicScreenFromLocation());
     };
     window.addEventListener("popstate", syncLocation);
     return () => window.removeEventListener("popstate", syncLocation);
@@ -258,9 +267,22 @@ function App() {
   }, []);
 
   if (booting) return <div className="loading-screen"><img className="brand-logo loading-logo" src="/aicte-logo.png" alt="AICTE logo" /><span>Loading secure workspace…</span></div>;
-  if (!user) return <Login onLogin={setUser} />;
+  if (!user) {
+    const openAuth = (mode: "login" | "register") => {
+      const params = new URLSearchParams();
+      params.set("auth", mode);
+      window.history.pushState(null, "", `${window.location.pathname}?${params.toString()}`);
+      setPublicScreen("auth");
+    };
+    const backToLanding = () => {
+      window.history.pushState(null, "", window.location.pathname);
+      setPublicScreen("landing");
+    };
+    if (publicScreen === "landing") return <LandingPage onNavigate={openAuth} />;
+    return <Login onLogin={setUser} onBackHome={backToLanding} />;
+  }
 
-  const logout = () => { localStorage.removeItem("vaulttrace_token"); setUser(null); };
+  const logout = () => { localStorage.removeItem("vaulttrace_token"); setUser(null); setPublicScreen("auth"); };
   return <div className="app-shell">
     <Sidebar page={page} setPage={setPage} role={user.role} onLogout={logout} />
     <div className="app-content">
@@ -274,10 +296,144 @@ function App() {
   </div>;
 }
 
-function Login({ onLogin }: { onLogin: (user: User) => void }) {
+function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") => void }) {
+  const workflowStages = [
+    ["01", "Submit", "Register an account and provide the details needed for review."],
+    ["02", "Verify", "Track email, identity, employee and institution checks separately."],
+    ["03", "Review", "Authorized reviewers record decisions and reasons."],
+    ["04", "Access", "Role access follows approval—not the applicant's request alone."],
+  ];
+  const capabilities = [
+    ["Evidence-led records", "Keep FDR details, supporting documents and field provenance together for review."],
+    ["Clear approval stages", "See where an account, instrument or release request sits in its workflow."],
+    ["Controlled decisions", "Use role checks, institution-scoped access and recorded decision history."],
+  ];
+  const roles = [
+    ["Institution teams", "Submit and track records for their associated institution."],
+    ["Review & verification", "Inspect evidence, resolve discrepancies and record review outcomes."],
+    ["Custody & policy", "Manage custody history and maintain versioned policy settings."],
+    ["Audit & administration", "Review activity history and administer access approvals."],
+  ];
+
+  return <main className="landing-page">
+    <header className="landing-header">
+      <a className="landing-brand" href="#home" aria-label="VaultTrace home">
+        <img className="brand-logo landing-logo" src="/aicte-logo.png" alt="" />
+        <span><b>VAULT<span>TRACE</span></b><small>Security deposit intelligence</small></span>
+      </a>
+      <nav className="landing-nav" aria-label="Main navigation">
+        <a href="#workflow">How it works</a>
+        <a href="#capabilities">Platform</a>
+        <button className="landing-signin" onClick={() => onNavigate("login")}>Sign in</button>
+        <button className="button primary landing-nav-cta" onClick={() => onNavigate("register")}>Request access<Icon name="arrow" size={15} /></button>
+      </nav>
+    </header>
+
+    <section className="landing-hero" id="home">
+      <div className="landing-hero-grid">
+        <div className="landing-copy">
+          <div className="landing-kicker"><span /> ACCOUNTABLE RECORDS · CONTROLLED WORKFLOWS</div>
+          <h1>Every deposit.<br /><em>Clear status.</em><br />Accountable decisions.</h1>
+          <p>VaultTrace brings institution records, fixed deposit receipts and review workflows into one carefully controlled workspace.</p>
+          <div className="landing-actions">
+            <button className="button primary" onClick={() => onNavigate("register")}>Request account access<Icon name="arrow" size={16} /></button>
+            <a className="landing-secondary-action" href="#workflow"><span className="landing-play">↓</span> Explore the workflow</a>
+          </div>
+          <div className="landing-assurance"><Icon name="shield" size={16} /><span>Access is role-based. Decisions are recorded. Evidence remains reviewable.</span></div>
+        </div>
+        <div className="landing-preview-wrap" aria-label="Illustrative VaultTrace interface preview">
+          <div className="landing-preview-glow" />
+          <div className="landing-preview">
+            <div className="preview-topbar"><span className="preview-mark">V</span><div><b>VaultTrace</b><small>Operations workspace</small></div><span className="preview-demo-label">ILLUSTRATIVE</span></div>
+            <div className="preview-body">
+              <div className="preview-eyebrow">RECORD OVERVIEW</div>
+              <div className="preview-title-row"><div><h2>Deposit records</h2><p>Review status at a glance</p></div><span className="preview-filter">All records⌄</span></div>
+              <div className="preview-stat-row">
+                <div><small>RECORD DETAILS</small><b>Institution · Bank · Dates</b><span>Structured information</span></div>
+                <div><small>REVIEW STATUS</small><b><i /> Under review</b><span>Decision history available</span></div>
+              </div>
+              <div className="preview-table">
+                <div className="preview-table-head"><span>WORKFLOW</span><span>STATUS</span></div>
+                <div className="preview-table-row"><span><i className="preview-dot dot-gold" /> Evidence review</span><b>In progress</b></div>
+                <div className="preview-table-row"><span><i className="preview-dot dot-blue" /> Verification</span><b>Queued</b></div>
+                <div className="preview-table-row"><span><i className="preview-dot dot-slate" /> Decision record</span><b>Audit trail</b></div>
+              </div>
+              <div className="preview-footer"><Icon name="shield" size={14} /><span>Illustrative preview · not live account data</span></div>
+            </div>
+          </div>
+          <div className="preview-float-card"><span className="preview-float-icon"><Icon name="check" size={17} /></span><span><b>Review with context</b><small>Evidence and decisions together</small></span></div>
+        </div>
+      </div>
+      <div className="landing-proof-strip" aria-label="Platform scope">
+        <span><b>8</b> requested account roles</span><i />
+        <span>Evidence &amp; decisions connected</span><i />
+        <span>Role-based access controls</span>
+      </div>
+    </section>
+
+    <section className="landing-workflow landing-section" id="workflow">
+      <div className="landing-section-heading">
+        <div className="landing-eyebrow">A clearer path from submission to decision</div>
+        <h2>One workspace for the<br /><em>whole review journey.</em></h2>
+        <p>Replace scattered handoffs with a shared view of the record, its supporting evidence and the next responsible action.</p>
+      </div>
+      <div className="landing-stage-grid">
+        {workflowStages.map(([number, title, description]) => <article className="landing-stage" key={number}>
+          <span className="stage-number">{number}</span><span className="stage-line" />
+          <h3>{title}</h3><p>{description}</p>
+        </article>)}
+      </div>
+    </section>
+
+    <section className="landing-capabilities" id="capabilities">
+      <div className="landing-capabilities-inner">
+        <div className="landing-capabilities-copy">
+          <div className="landing-eyebrow">Built around responsible operations</div>
+          <h2>Information in context.<br /><em>Action with accountability.</em></h2>
+          <p>VaultTrace is designed to help teams move from record handling to informed, traceable decisions—without treating automation as proof.</p>
+          <button className="landing-outline-button" onClick={() => onNavigate("register")}>See the workflow in action<Icon name="arrow" size={15} /></button>
+        </div>
+        <div className="landing-capability-list">
+          {capabilities.map(([title, description], index) => <article className="landing-capability" key={title}>
+            <span>0{index + 1}</span><div><h3>{title}</h3><p>{description}</p></div><Icon name="arrow" size={16} />
+          </article>)}
+        </div>
+      </div>
+    </section>
+
+    <section className="landing-roles landing-section">
+      <div className="landing-section-heading">
+        <div className="landing-eyebrow">Designed for accountable teams</div>
+        <h2>The right view for<br /><em>every responsibility.</em></h2>
+      </div>
+      <div className="landing-role-grid">{roles.map(([title, description], index) => <article className="landing-role" key={title}>
+        <span className="landing-role-index">0{index + 1}</span><h3>{title}</h3><p>{description}</p>
+      </article>)}</div>
+    </section>
+
+    <section className="landing-final">
+      <div className="landing-final-inner">
+        <div className="landing-eyebrow">Start with a clear process</div>
+        <h2>Better records make<br /><em>better decisions possible.</em></h2>
+        <p>Request access to VaultTrace and follow the review steps for your role.</p>
+        <div className="landing-actions landing-final-actions">
+          <button className="button primary" onClick={() => onNavigate("register")}>Create an account request<Icon name="arrow" size={16} /></button>
+          <button className="landing-final-login" onClick={() => onNavigate("login")}>Already have access? Sign in</button>
+        </div>
+      </div>
+    </section>
+    <footer className="landing-footer">
+      <a className="landing-brand" href="#home"><img className="brand-logo landing-logo" src="/aicte-logo.png" alt="" /><span><b>VAULT<span>TRACE</span></b><small>Security deposit intelligence</small></span></a>
+      <span>Independent SIH 2026 prototype · Not an official government portal</span>
+      <a href="#home">Back to top ↑</a>
+    </footer>
+  </main>;
+}
+
+function Login({ onLogin, onBackHome }: { onLogin: (user: User) => void; onBackHome: () => void }) {
   const params = new URLSearchParams(window.location.search);
   const [mode, setMode] = useState<"login" | "register" | "status" | "forgot" | "reset">(
-    params.has("resetPassword") ? "reset" : params.has("registrationId") ? "status" : "login",
+    params.has("resetPassword") ? "reset" : params.has("registrationId") || params.get("auth") === "status" ? "status" : params.get("auth") === "register" ? "register" : "login",
   );
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -357,7 +513,15 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
       window.history.replaceState(null, "", window.location.pathname);
     } catch (e) { setError((e as Error).message); } finally { setLoading(false); }
   };
-  const switchMode = (next: typeof mode) => { setError(""); setNotice(""); setMode(next); };
+  const switchMode = (next: typeof mode) => {
+    setError(""); setNotice(""); setMode(next);
+    if (["login", "register", "status"].includes(next)) {
+      const nextParams = new URLSearchParams();
+      if (next === "status" && registrationId) nextParams.set("registrationId", registrationId);
+      else nextParams.set("auth", next);
+      window.history.pushState(null, "", `${window.location.pathname}?${nextParams.toString()}`);
+    }
+  };
   const heading = mode === "login" ? "Welcome back" : mode === "register" ? "Create your account" : mode === "status" ? "Registration status" : mode === "forgot" ? "Reset your password" : "Choose a new password";
   const cardClass = [
     "login-card",
@@ -380,6 +544,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
       </div>
     </div>
     <section className={cardClass} ref={authCardRef}>
+      <button className="auth-home-button" type="button" onClick={onBackHome}>← VaultTrace home</button>
       <div className="mobile-brand"><img className="brand-logo mobile-logo" src="/aicte-logo.png" alt="AICTE logo" /><b>VAULT<span>TRACE</span></b></div>
       <div className="eyebrow">SIH 2026 PROTOTYPE</div>
       <h2>{heading}</h2>
@@ -412,7 +577,12 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
           <p className="demo-password-note">Shared demo password <code>{demoPassword}</code>. Demo shortcuts are available only in local development.</p>
         </section>}
       </>}
-      {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => { setRegistrationId(id); setStatusEmail(email); setNotice(message); setVerificationMessage(""); switchMode("status"); setNotice(message); }} onCancel={() => switchMode("login")} />}
+      {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => {
+        setRegistrationId(id); setStatusEmail(email); setNotice(message); setVerificationMessage(""); setError(""); setMode("status");
+        const nextParams = new URLSearchParams();
+        nextParams.set("registrationId", id);
+        window.history.pushState(null, "", `${window.location.pathname}?${nextParams.toString()}`);
+      }} onCancel={() => switchMode("login")} />}
       {mode === "status" && <RegistrationStatusScreen registrationId={registrationId} initialEmail={statusEmail} initialMessage={verificationMessage} onBack={() => switchMode("login")} onError={setError} onNotice={setNotice} />}
       {mode === "forgot" && <form onSubmit={requestReset}><label htmlFor="reset-email">Account email<input id="reset-email" name="email" type="email" autoComplete="email" required /></label><button className="button primary wide" disabled={loading}>{loading ? "Sending…" : "Send reset instructions"}</button><button type="button" className="auth-text-button" onClick={() => switchMode("login")}>Back to sign in</button></form>}
       {mode === "reset" && <form onSubmit={confirmReset}><label htmlFor="reset-token">Reset token<input id="reset-token" value={resetToken} onChange={(e) => setResetToken(e.target.value)} required minLength={20} autoComplete="one-time-code" /></label><label htmlFor="new-password">New password<input id="new-password" name="password" type="password" required minLength={12} maxLength={128} autoComplete="new-password" /></label><button className="button primary wide" disabled={loading}>{loading ? "Updating…" : "Set new password"}</button><button type="button" className="auth-text-button" onClick={() => switchMode("login")}>Back to sign in</button></form>}
