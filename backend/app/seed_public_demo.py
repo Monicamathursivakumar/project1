@@ -23,17 +23,17 @@ from .main import (
     LifecycleEvent,
     PolicyRule,
     ProvenanceLevel,
+    ReleaseRequest,
     RegistrationAuditEvent,
     RegistrationRequest,
     Role,
     SessionLocal,
-    settings,
     User,
     UserInstitutionMembership,
-    FdrStatus,
     VerificationCase,
     VerificationStatus,
     pwd_context,
+    settings,
 )
 
 PUBLIC_DEMO_STATE = Table(
@@ -78,8 +78,12 @@ INSTITUTION_DRAFT = "DEMO-INSTITUTION-DRAFT-001"
 VERIFIED_CASE = "DEMO-VERIFICATION-COMPLETE-001"
 DEMO_INSTITUTION_TARGET = 3000
 DEMO_FDR_TARGET = 438
-DEMO_VERIFIED_TARGET = 8
-DEMO_ATTENTION_TARGET = 2
+DEMO_STATUS_TARGETS = {
+    FdrStatus.verified: 348,
+    FdrStatus.under_review: 36,
+    FdrStatus.submitted: 13,
+    FdrStatus.draft: 41,
+}
 
 
 def _synthetic_identity_image() -> bytes:
@@ -264,6 +268,7 @@ def _seed_registration_samples() -> None:
 def _seed_dashboard_volume() -> None:
     now = datetime.now(timezone.utc)
     with SessionLocal() as db:
+        PUBLIC_DEMO_STATE.create(bind=db.get_bind(), checkfirst=True)
         admin = db.scalar(select(User).where(User.username == "demo_administrator"))
         if admin is None:
             raise RuntimeError("The public demo administrator must exist before dashboard data is seeded.")
@@ -292,42 +297,79 @@ def _seed_dashboard_volume() -> None:
             missing_institutions -= 1
         db.flush()
 
-        fdr_count = db.query(Fdr).count()
-        verified_count = db.query(Fdr).filter(Fdr.status == FdrStatus.verified).count()
-        attention_count = db.query(Fdr).filter(
-            Fdr.status.in_([FdrStatus.submitted, FdrStatus.under_review])
-        ).count()
-        verified_to_add = max(0, DEMO_VERIFIED_TARGET - verified_count)
-        attention_to_add = max(0, DEMO_ATTENTION_TARGET - attention_count)
-        missing_fdrs = max(
-            DEMO_FDR_TARGET - fdr_count,
-            verified_to_add + attention_to_add,
+        distribution_key = "dashboard_status_distribution_v2"
+        distribution_initialized = db.execute(
+            select(PUBLIC_DEMO_STATE.c.value).where(PUBLIC_DEMO_STATE.c.key == distribution_key)
+        ).scalar_one_or_none()
+        if distribution_initialized is not None:
+            db.commit()
+            return
+
+        scenario_examples = db.scalars(
+            select(Fdr).where(Fdr.identifier.in_(("DEMO-FDR-004", "DEMO-FDR-005")))
+        ).all()
+        for fdr in scenario_examples:
+            if fdr.status in {FdrStatus.release_requested, FdrStatus.closed}:
+                previous_status = fdr.status.value
+                fdr.status = FdrStatus.draft
+                db.add(LifecycleEvent(
+                    fdr_id=fdr.id,
+                    from_status=previous_status,
+                    to_status=FdrStatus.draft.value,
+                    reason="Synthetic dashboard sample distribution update.",
+                    actor_id=admin.id,
+                ))
+                if fdr.identifier == "DEMO-FDR-004":
+                    release_request = db.scalar(
+                        select(ReleaseRequest).where(
+                            ReleaseRequest.fdr_id == fdr.id,
+                            ReleaseRequest.status == "pending",
+                        )
+                    )
+                    if release_request:
+                        release_request.status = "cancelled"
+                        release_request.decision_notes = "Cancelled when updating the synthetic dashboard status distribution."
+                    verification_case = db.scalar(
+                        select(VerificationCase).where(VerificationCase.fdr_id == fdr.id)
+                    )
+                    if verification_case:
+                        verification_case.status = VerificationStatus.pending
+                        verification_case.evidence_reference = ""
+                        verification_case.outcome_notes = "Synthetic demo case returned to a pending state."
+
+        db.flush()
+        volume_rows = db.scalars(
+            select(Fdr).where(Fdr.identifier.like("DEMO-VOLUME-%")).order_by(Fdr.identifier)
+        ).all()
+        base_rows = db.scalars(
+            select(Fdr).where(~Fdr.identifier.like("DEMO-VOLUME-%"))
+        ).all()
+        base_counts = {status: 0 for status in DEMO_STATUS_TARGETS}
+        for fdr in base_rows:
+            if fdr.status in base_counts:
+                base_counts[fdr.status] += 1
+        volume_targets = {
+            status: max(0, target - base_counts[status])
+            for status, target in DEMO_STATUS_TARGETS.items()
+        }
+        base_count = len(base_rows)
+        target_volume_count = max(
+            DEMO_FDR_TARGET - base_count,
+            sum(volume_targets.values()),
             0,
         )
-        existing_volume_ids = set(db.scalars(
-            select(Fdr.identifier).where(Fdr.identifier.like("DEMO-VOLUME-%"))
-        ).all())
+
         next_fdr_number = 1
         verification_officer = db.scalar(
             select(User).where(User.username == "demo_verification_officer")
         )
-        added = 0
-        verified_added = 0
-        attention_added = 0
-        while added < missing_fdrs:
+        existing_volume_ids = {fdr.identifier for fdr in volume_rows}
+        while len(volume_rows) < target_volume_count:
             identifier = f"DEMO-VOLUME-{next_fdr_number:04d}"
             next_fdr_number += 1
             if identifier in existing_volume_ids:
                 continue
             institution = institutions[(next_fdr_number - 2) % len(institutions)]
-            if verified_added < verified_to_add:
-                status = FdrStatus.verified
-                verified_added += 1
-            elif attention_added < attention_to_add:
-                status = FdrStatus.under_review if attention_added % 2 else FdrStatus.submitted
-                attention_added += 1
-            else:
-                status = FdrStatus.draft
             amount = 500_000 + (next_fdr_number % 20) * 50_000
             fdr = Fdr(
                 identifier=identifier,
@@ -345,11 +387,12 @@ def _seed_dashboard_volume() -> None:
                 lien_endorsed=True,
                 lien_clause="Synthetic demo data; not bank evidence.",
                 maturity_date=now + timedelta(days=30 + next_fdr_number % 330),
-                status=status,
+                status=FdrStatus.draft,
                 created_by=admin.id,
             )
             db.add(fdr)
             db.flush()
+            volume_rows.append(fdr)
             db.add(InstrumentVersion(
                 fdr_id=fdr.id,
                 version_number=1,
@@ -360,7 +403,7 @@ def _seed_dashboard_volume() -> None:
             db.add(LifecycleEvent(
                 fdr_id=fdr.id,
                 from_status="",
-                to_status=status.value,
+                to_status=FdrStatus.draft.value,
                 reason="Synthetic sample record for dashboard and registry demonstrations.",
                 actor_id=admin.id,
             ))
@@ -371,22 +414,6 @@ def _seed_dashboard_volume() -> None:
                 level=ProvenanceLevel.declared,
                 evidence_reference="Synthetic public demo data; not bank evidence.",
             ))
-            if status == FdrStatus.verified:
-                db.add(VerificationCase(
-                    fdr_id=fdr.id,
-                    status=VerificationStatus.verified,
-                    assigned_to=verification_officer.id if verification_officer else admin.id,
-                    outcome_notes="Synthetic verified-status example for dashboard demonstration; no real bank verification.",
-                    evidence_reference=f"DEMO-SYNTHETIC-{next_fdr_number:04d}",
-                ))
-            elif status in {FdrStatus.submitted, FdrStatus.under_review}:
-                db.add(VerificationCase(
-                    fdr_id=fdr.id,
-                    status=VerificationStatus.in_review if status == FdrStatus.under_review else VerificationStatus.pending,
-                    assigned_to=verification_officer.id if verification_officer else None,
-                    outcome_notes="Synthetic pending verification example for dashboard demonstration.",
-                    evidence_reference="",
-                ))
             db.add(AuditEvent(
                 actor_id=admin.id,
                 action="scenario_seeded",
@@ -395,7 +422,52 @@ def _seed_dashboard_volume() -> None:
                 details="Synthetic public demo volume record; not a real financial instrument.",
             ))
             existing_volume_ids.add(identifier)
-            added += 1
+
+        assigned_statuses = [
+            status
+            for status, count in volume_targets.items()
+            for _ in range(count)
+        ]
+        assigned_statuses.extend(
+            [FdrStatus.draft] * max(0, len(volume_rows) - len(assigned_statuses))
+        )
+        for fdr, status in zip(volume_rows, assigned_statuses):
+            previous_status = fdr.status
+            fdr.status = status
+            if previous_status != status:
+                db.add(LifecycleEvent(
+                    fdr_id=fdr.id,
+                    from_status=previous_status.value,
+                    to_status=status.value,
+                    reason="Synthetic dashboard sample distribution update.",
+                    actor_id=admin.id,
+                ))
+            if status in {FdrStatus.verified, FdrStatus.under_review, FdrStatus.submitted}:
+                verification_case = db.scalar(
+                    select(VerificationCase).where(VerificationCase.fdr_id == fdr.id)
+                )
+                verification_status = {
+                    FdrStatus.verified: VerificationStatus.verified,
+                    FdrStatus.under_review: VerificationStatus.in_review,
+                    FdrStatus.submitted: VerificationStatus.pending,
+                }[status]
+                if verification_case is None:
+                    verification_case = VerificationCase(fdr_id=fdr.id)
+                    db.add(verification_case)
+                verification_case.status = verification_status
+                verification_case.assigned_to = verification_officer.id if verification_officer else None
+                verification_case.outcome_notes = (
+                    "Synthetic verified-status example for dashboard demonstration; no real bank verification."
+                    if status == FdrStatus.verified
+                    else "Synthetic pending verification example for dashboard demonstration."
+                )
+                verification_case.evidence_reference = (
+                    f"DEMO-SYNTHETIC-{fdr.identifier.rsplit('-', 1)[-1]}"
+                    if status == FdrStatus.verified
+                    else ""
+                )
+
+        db.execute(insert(PUBLIC_DEMO_STATE).values(key=distribution_key, value="true"))
         db.commit()
 
 

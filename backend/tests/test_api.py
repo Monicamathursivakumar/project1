@@ -1014,10 +1014,13 @@ def test_public_demo_dashboard_volume_seeds_requested_counts_idempotently(monkey
     with isolated_sessions() as db:
         assert db.scalar(select(func.count(Institution.id))) == 3000
         assert db.scalar(select(func.count(Fdr.id))) == 438
-        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.verified)) == 8
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.verified)) == 348
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.under_review)) == 36
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.submitted)) == 13
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.draft)) == 41
         assert db.scalar(select(func.count(Fdr.id)).where(
             Fdr.status.in_([FdrStatus.submitted, FdrStatus.under_review])
-        )) == 2
+        )) == 49
         assert db.scalar(select(func.count(Fdr.id)).where(Fdr.identifier.like("DEMO-VOLUME-%"))) == 430
     engine.dispose()
 
