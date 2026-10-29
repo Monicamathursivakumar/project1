@@ -6,6 +6,8 @@ down_revision = "0003_operations"
 
 
 def upgrade():
+    bind = op.get_bind()
+    existing_columns = {column["name"] for column in sa.inspect(bind).get_columns("fdrs")}
     columns = [
         ("approval_case_reference", sa.String(100)),
         ("bank_name", sa.String(255)),
@@ -20,9 +22,12 @@ def upgrade():
     ]
     for column in columns:
         name, type_, *default = column
-        op.add_column("fdrs", sa.Column(name, type_, nullable=True, server_default=str(default[0]).lower() if default else None))
+        if name not in existing_columns:
+            op.add_column("fdrs", sa.Column(name, type_, nullable=True, server_default=str(default[0]).lower() if default else None))
 
 
 def downgrade():
+    existing_columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("fdrs")}
     for name in ("lien_clause", "lien_endorsed", "joint_holder", "beneficiary", "issue_date", "amount_in_words", "ifsc_code", "branch_name", "bank_name", "approval_case_reference"):
-        op.drop_column("fdrs", name)
+        if name in existing_columns:
+            op.drop_column("fdrs", name)

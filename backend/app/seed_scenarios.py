@@ -120,6 +120,100 @@ def seed_scenarios() -> int:
         return created
 
 
+def seed_maturity_calendar() -> int:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        user = db.scalar(select(User).order_by(User.id))
+        institutions = db.scalars(select(Institution).order_by(Institution.id).limit(6)).all()
+        if not user or len(institutions) < 3:
+            raise RuntimeError("The administrator and institution catalogue must be loaded first")
+
+        existing_rows = db.scalars(select(Fdr).where(Fdr.identifier.like("DEMO-MATURITY-%"))).all()
+        existing = {row.identifier for row in existing_rows}
+        repaired = 0
+        for row in existing_rows:
+            if row.issue_date is None:
+                maturity_date = row.maturity_date
+                if maturity_date.tzinfo is None:
+                    maturity_date = maturity_date.replace(tzinfo=timezone.utc)
+                row.issue_date = maturity_date - timedelta(days=365)
+                repaired += 1
+        statuses = [FdrStatus.draft, FdrStatus.submitted, FdrStatus.under_review]
+        created = 0
+        following_month = 1 if now.month == 12 else now.month + 1
+        following_year = now.year + 1 if now.month == 12 else now.year
+        last_day = (datetime(following_year, following_month, 1, tzinfo=timezone.utc) - timedelta(days=1)).day
+        current_month_day = min(now.day + 1, last_day)
+        for position, hour in enumerate((12, 14, 16)):
+            identifier = f"DEMO-MATURITY-CURRENT-{position + 1:02d}"
+            if identifier in existing:
+                continue
+            institution = institutions[position % len(institutions)]
+            maturity_date = datetime(now.year, now.month, current_month_day, hour, tzinfo=timezone.utc)
+            fdr = Fdr(
+                identifier=identifier,
+                institution_id=institution.id,
+                holder_name=institution.name,
+                amount=750000 + position * 250000,
+                issue_date=maturity_date - timedelta(days=365),
+                maturity_date=maturity_date,
+                status=statuses[position % len(statuses)],
+                created_by=user.id,
+            )
+            db.add(fdr)
+            db.flush()
+            db.add(AuditEvent(
+                actor_id=user.id,
+                action="maturity_demo_seeded",
+                entity="fdr",
+                entity_id=str(fdr.id),
+                details="Clearly labeled demo calendar data; not a verified instrument.",
+            ))
+            existing.add(identifier)
+            created += 1
+
+        for month_offset in range(12):
+            year, month = divmod(now.month - 1 + month_offset, 12)
+            year += now.year
+            month += 1
+            if month_offset == 0:
+                maturity_dates = [now + timedelta(days=offset) for offset in (3, 6, 9)]
+            else:
+                maturity_dates = [datetime(year, month, day, 12, tzinfo=timezone.utc) for day in (5, 15, 25)]
+
+            for position, maturity_date in enumerate(maturity_dates):
+                identifier = f"DEMO-MATURITY-{month_offset + 1:02d}-{position + 1:02d}"
+                if identifier in existing:
+                    continue
+                institution = institutions[(month_offset * 3 + position) % len(institutions)]
+                fdr = Fdr(
+                    identifier=identifier,
+                    institution_id=institution.id,
+                    holder_name=institution.name,
+                    amount=500000 + ((month_offset * 3 + position) % 8) * 250000,
+                    issue_date=maturity_date - timedelta(days=365),
+                    maturity_date=maturity_date,
+                    status=statuses[(month_offset + position) % len(statuses)],
+                    created_by=user.id,
+                )
+                db.add(fdr)
+                db.flush()
+                db.add(AuditEvent(
+                    actor_id=user.id,
+                    action="maturity_demo_seeded",
+                    entity="fdr",
+                    entity_id=str(fdr.id),
+                    details="Clearly labeled demo calendar data; not a verified instrument.",
+                ))
+                existing.add(identifier)
+                created += 1
+
+        db.commit()
+        if repaired:
+            print(f"Repaired {repaired} demo maturity issue dates")
+        return created
+
+
 def seed_demo_documents() -> int:
     source_dir = Path(__file__).parents[2] / "project-main" / "data" / "documents"
     sources = sorted(source_dir.glob("*.pdf")) if source_dir.exists() else []
@@ -156,7 +250,11 @@ def seed_demo_documents() -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed linked VaultTrace demo scenarios")
-    parser.parse_args()
+    parser.add_argument("--maturity-calendar-only", action="store_true", help="Seed only clearly labeled maturity calendar examples")
+    args = parser.parse_args()
+    if args.maturity_calendar_only:
+        print(f"Created {seed_maturity_calendar()} demo maturity calendar records")
+        return
     print(f"Created {seed_scenarios()} demo FDR scenarios")
     print(f"Created {seed_demo_documents()} demo evidence documents")
 

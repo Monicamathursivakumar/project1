@@ -1,29 +1,34 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Generator
+from typing import Annotated, Generator, Optional
 import hashlib
 import csv
 import io
 import json
+import secrets
+import smtplib
 import uuid
 import shutil
 import re
 import httpx
 import fitz
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageOps
+from email.message import EmailMessage
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, String, Text, create_engine, func, select
+from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 
 
 class Settings(BaseSettings):
@@ -32,6 +37,20 @@ class Settings(BaseSettings):
     access_token_minutes: int = 60
     upload_dir: str = "./private_uploads"
     max_upload_bytes: int = 10 * 1024 * 1024
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    bootstrap_token: str | None = None
+    initial_admin_password: str | None = None
+    app_environment: str = "development"
+    frontend_base_url: str = "http://localhost:5173"
+    email_verification_base_url: str | None = None
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from_email: str | None = None
+    github_client_id: str | None = None
+    github_client_secret: str | None = None
+    github_callback_url: str | None = None
     tesseract_cmd: str | None = None
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
@@ -39,8 +58,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=connect_args)
+database_url = settings.database_url
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+engine = create_engine(database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
@@ -58,6 +82,31 @@ class Role(str, Enum):
     custody = "custody"
     auditor = "auditor"
     policy_admin = "policy_admin"
+    institution_user = "institution_user"
+    verification_officer = "verification_officer"
+
+
+class RegistrationAccountType(str, Enum):
+    institution_user = "institution_user"
+    reviewing_officer = "reviewing_officer"
+    verification_officer = "verification_officer"
+    custody_officer = "custody_officer"
+    policy_administrator = "policy_administrator"
+    auditor = "auditor"
+    administrator = "administrator"
+    viewer = "viewer"
+
+
+ACCOUNT_TYPE_ROLES = {
+    RegistrationAccountType.institution_user: Role.institution_user,
+    RegistrationAccountType.reviewing_officer: Role.reviewer,
+    RegistrationAccountType.verification_officer: Role.verification_officer,
+    RegistrationAccountType.custody_officer: Role.custody,
+    RegistrationAccountType.policy_administrator: Role.policy_admin,
+    RegistrationAccountType.auditor: Role.auditor,
+    RegistrationAccountType.administrator: Role.admin,
+    RegistrationAccountType.viewer: Role.viewer,
+}
 
 
 class FdrStatus(str, Enum):
@@ -84,6 +133,15 @@ class DiscrepancyStatus(str, Enum):
     open = "open"
     resolved = "resolved"
     waived = "waived"
+
+
+class DiscrepancyReviewAction(str, Enum):
+    mark_reviewed = "mark_reviewed"
+    confirm = "confirm"
+    dismiss = "dismiss"
+    add_note = "add_note"
+    request_evidence = "request_evidence"
+    escalate = "escalate"
 
 
 class ProvenanceLevel(str, Enum):
@@ -113,9 +171,100 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(320), unique=True, index=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[Role] = mapped_column(SqlEnum(Role), default=Role.viewer)
     active: Mapped[bool] = mapped_column(default=True)
+
+
+class RegistrationRequest(Base):
+    __tablename__ = "registration_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(200))
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    account_type: Mapped[str] = mapped_column(String(40))
+    organization_name: Mapped[str] = mapped_column(String(255), default="")
+    institution_id: Mapped[Optional[int]] = mapped_column(ForeignKey("institutions.id"), nullable=True, index=True)
+    employee_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, nullable=True)
+    department: Mapped[str] = mapped_column(String(150), default="")
+    designation: Mapped[str] = mapped_column(String(150), default="")
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    identity_status: Mapped[str] = mapped_column(String(30), default="pending")
+    employee_status: Mapped[str] = mapped_column(String(30), default="not_required")
+    institution_status: Mapped[str] = mapped_column(String(30), default="not_required")
+    role_status: Mapped[str] = mapped_column(String(30), default="pending")
+    status: Mapped[str] = mapped_column(String(50), default="pending_email_verification", index=True)
+    github_provider_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    github_login: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    github_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    identity_document_stored_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    identity_document_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    identity_document_content_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    identity_document_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    identity_document_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    decision_actor_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    decision_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class EmployeeVerification(Base):
+    __tablename__ = "employee_verifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registration_id: Mapped[int] = mapped_column(ForeignKey("registration_requests.id"), unique=True, index=True)
+    employee_id: Mapped[str] = mapped_column(String(100), unique=True)
+    full_name: Mapped[str] = mapped_column(String(200))
+    official_email: Mapped[str] = mapped_column(String(320))
+    organization_name: Mapped[str] = mapped_column(String(255))
+    department: Mapped[str] = mapped_column(String(150))
+    designation: Mapped[str] = mapped_column(String(150))
+    requested_role: Mapped[str] = mapped_column(String(40))
+    method: Mapped[str] = mapped_column(String(40), default="manual_review")
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    evidence_reference: Mapped[str] = mapped_column(String(500), default="")
+    reviewer_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class AuthTokenRecord(Base):
+    __tablename__ = "auth_token_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registration_id: Mapped[Optional[int]] = mapped_column(ForeignKey("registration_requests.id"), nullable=True, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(30))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class GithubOAuthState(Base):
+    __tablename__ = "github_oauth_states"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registration_id: Mapped[int] = mapped_column(ForeignKey("registration_requests.id"), index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class RegistrationAuditEvent(Base):
+    __tablename__ = "registration_audit_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    registration_id: Mapped[int] = mapped_column(ForeignKey("registration_requests.id"), index=True)
+    actor_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(50))
+    previous_status: Mapped[str] = mapped_column(String(50), default="")
+    new_status: Mapped[str] = mapped_column(String(50), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class UserInstitutionMembership(Base):
@@ -319,6 +468,29 @@ class Discrepancy(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class DiscrepancyAnalysisDetail(Base):
+    __tablename__ = "discrepancy_analysis_details"
+    discrepancy_id: Mapped[int] = mapped_column(ForeignKey("discrepancies.id"), primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    affected_field: Mapped[str] = mapped_column(String(100), default="")
+    expected_source: Mapped[str] = mapped_column(String(500), default="")
+    observed_source: Mapped[str] = mapped_column(String(500), default="")
+    recommended_action: Mapped[str] = mapped_column(Text, default="")
+    evidence_reference: Mapped[str] = mapped_column(String(1000), default="")
+    analysis_method: Mapped[str] = mapped_column(String(50), default="rule_based")
+    review_status: Mapped[str] = mapped_column(String(40), default="pending")
+
+
+class DiscrepancyReviewEvent(Base):
+    __tablename__ = "discrepancy_review_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discrepancy_id: Mapped[int] = mapped_column(ForeignKey("discrepancies.id"), index=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    action: Mapped[str] = mapped_column(String(40))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class VerificationCase(Base):
     __tablename__ = "verification_cases"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -392,7 +564,12 @@ class NotificationEvent(Base):
 Base.metadata.create_all(engine)
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="VaultTrace API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+allowed_origins = [
+    origin if "://" in origin else f"https://{origin}"
+    for value in settings.cors_origins.split(",")
+    if (origin := value.strip().rstrip("/"))
+]
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 def db_session() -> Generator[Session, None, None]:
@@ -457,6 +634,10 @@ def can_change_status(user: User, current: FdrStatus, target: FdrStatus) -> bool
     if user.role == Role.admin:
         return True
     transitions = {
+        Role.institution_user: {
+            FdrStatus.draft: {FdrStatus.submitted},
+            FdrStatus.verified: {FdrStatus.release_requested},
+        },
         Role.officer: {
             FdrStatus.draft: {FdrStatus.submitted},
             FdrStatus.verified: {FdrStatus.release_requested},
@@ -476,11 +657,103 @@ class Token(BaseModel):
     token_type: str
 
 
+class RegistrationIn(BaseModel):
+    username: str = Field(min_length=3, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    full_name: str = Field(min_length=2, max_length=200)
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=12, max_length=128)
+    password_confirmation: str = Field(min_length=12, max_length=128)
+    account_type: RegistrationAccountType
+    organization_name: str = Field(default="", max_length=255)
+    institution_id: int | None = None
+    employee_id: str | None = Field(default=None, max_length=100)
+    department: str = Field(default="", max_length=150)
+    designation: str = Field(default="", max_length=150)
+    consent: bool
+
+    @model_validator(mode="after")
+    def validate_registration(self):
+        if self.password != self.password_confirmation:
+            raise ValueError("Password confirmation does not match")
+        if not self.consent:
+            raise ValueError("Registration consent is required")
+        if self.account_type == RegistrationAccountType.institution_user and not self.institution_id:
+            raise ValueError("Select the institution you are requesting to join")
+        if self.account_type not in {RegistrationAccountType.institution_user, RegistrationAccountType.viewer}:
+            if not self.employee_id or not self.organization_name.strip() or not self.department.strip() or not self.designation.strip():
+                raise ValueError("Employee ID, organization, department and designation are required for this account type")
+        return self
+
+
+class RegistrationResubmitIn(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    full_name: str = Field(min_length=2, max_length=200)
+    organization_name: str = Field(default="", max_length=255)
+    institution_id: int | None = None
+    employee_id: str | None = Field(default=None, max_length=100)
+    department: str = Field(default="", max_length=150)
+    designation: str = Field(default="", max_length=150)
+
+
+class RegistrationStatusOut(BaseModel):
+    registration_id: str
+    account_type: str
+    status: str
+    email_verification: str
+    identity_verification: str
+    employee_verification: str
+    institution_association: str
+    role_approval: str
+    updated_at: datetime
+    decision_reason: str = ""
+
+
+class RegistrationDecisionIn(BaseModel):
+    action: str = Field(pattern=r"^(verify_identity|verify_employee|verify_institution|approve_role|reject)$")
+    reason: str = Field(min_length=3, max_length=2000)
+    evidence_reference: str = Field(default="", max_length=500)
+
+
+class RegistrationStatusLookupIn(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+
+
+class PasswordResetConfirmIn(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+    password: str = Field(min_length=12, max_length=128)
+
+
+class OneTimeTokenIn(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class GitHubOAuthStartOut(BaseModel):
+    authorization_url: str
+
+
+class AdminUserOut(BaseModel):
+    id: int
+    username: str
+    email: str | None
+    role: Role
+    active: bool
+
+
+class UserActivationIn(BaseModel):
+    active: bool
+    reason: str = Field(min_length=3, max_length=2000)
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     username: str
     role: Role
+    email: str | None = None
 
 
 class InstitutionIn(BaseModel):
@@ -540,7 +813,7 @@ class FdrIn(BaseModel):
 
     @model_validator(mode="after")
     def validate_registration(self):
-        if self.maturity_date <= self.issue_date:
+        if self.issue_date and self.maturity_date <= self.issue_date:
             raise ValueError("Maturity date must be after issue date")
         if self.lien_endorsed and len(self.lien_clause.strip()) < 5:
             raise ValueError("Lien clause is required when lien endorsement is selected")
@@ -649,6 +922,15 @@ class ResolutionIn(BaseModel):
     resolution_notes: str = Field(min_length=5)
 
 
+class DiscrepancyReviewIn(BaseModel):
+    action: DiscrepancyReviewAction
+    reason: str = Field(min_length=3, max_length=2000)
+
+
+class DiscrepancyChatIn(BaseModel):
+    question: str = Field(min_length=2, max_length=500)
+
+
 class VerificationIn(BaseModel):
     status: VerificationStatus
     outcome_notes: str = Field(min_length=5)
@@ -705,10 +987,126 @@ def health(db: Db):
     return {"status": "ok", "database": "connected"}
 
 
+def normalized_email(value: str) -> str:
+    email = value.strip().casefold()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address")
+    return email
+
+
+def token_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def ensure_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def normalized_base_url(value: str) -> str:
+    value = value.strip().rstrip("/")
+    return value if re.match(r"^https?://", value, re.IGNORECASE) else f"https://{value}"
+
+
+def send_account_email(recipient: str, subject: str, body: str) -> bool:
+    if not settings.smtp_host or not settings.smtp_from_email:
+        return False
+    message = EmailMessage()
+    message["From"] = settings.smtp_from_email
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    if settings.smtp_port == 465:
+        with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password or "")
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
+            smtp.starttls()
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password or "")
+            smtp.send_message(message)
+    return True
+
+
+def issue_auth_token(
+    db: Session,
+    purpose: str,
+    registration_id: int | None = None,
+    user_id: int | None = None,
+    lifetime: timedelta = timedelta(hours=24),
+) -> str:
+    token = secrets.token_urlsafe(32)
+    db.add(AuthTokenRecord(
+        registration_id=registration_id,
+        user_id=user_id,
+        token_hash=token_digest(token),
+        purpose=purpose,
+        expires_at=datetime.now(timezone.utc) + lifetime,
+    ))
+    return token
+
+
+def registration_status(request: RegistrationRequest) -> str:
+    if request.status == "rejected":
+        return "rejected"
+    if request.email_verified_at is None:
+        return "pending_email_verification"
+    if request.identity_status != "approved":
+        return "pending_identity_verification"
+    if request.employee_status not in {"approved", "not_required"}:
+        return "pending_employee_verification"
+    if request.institution_status not in {"approved", "not_required"}:
+        return "pending_organization_verification"
+    if request.role_status != "approved":
+        return "pending_role_approval"
+    return "approved"
+
+
+def update_registration_status(request: RegistrationRequest) -> str:
+    previous = request.status
+    request.status = registration_status(request)
+    request.updated_at = datetime.now(timezone.utc)
+    return previous
+
+
+def registration_status_payload(request: RegistrationRequest) -> RegistrationStatusOut:
+    return RegistrationStatusOut(
+        registration_id=request.public_id,
+        account_type=request.account_type,
+        status=request.status,
+        email_verification="verified" if request.email_verified_at else "pending",
+        identity_verification=request.identity_status,
+        employee_verification=request.employee_status,
+        institution_association=request.institution_status,
+        role_approval=request.role_status,
+        updated_at=request.updated_at,
+        decision_reason=request.decision_reason,
+    )
+
+
+def add_registration_audit(
+    db: Session,
+    request: RegistrationRequest,
+    actor_id: int | None,
+    action: str,
+    previous_status: str,
+    reason: str = "",
+) -> None:
+    db.add(RegistrationAuditEvent(
+        registration_id=request.id,
+        actor_id=actor_id,
+        action=action,
+        previous_status=previous_status,
+        new_status=request.status,
+        reason=reason,
+    ))
+
+
 @app.post("/api/auth/token", response_model=Token)
 def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: Db):
     user = db.scalar(select(User).where(User.username == form.username))
-    if not user or not pwd_context.verify(form.password, user.password_hash):
+    if not user or not user.active or not pwd_context.verify(form.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     return {"access_token": token_for(user), "token_type": "bearer"}
 
@@ -716,6 +1114,689 @@ def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: Db):
 @app.get("/api/auth/me", response_model=UserOut)
 def me(user: Annotated[User, Depends(current_user)]):
     return user
+
+
+@app.get("/api/auth/registration-institutions")
+def registration_institutions(db: Db):
+    return db.execute(
+        select(Institution.id, Institution.name, Institution.code).order_by(Institution.name).limit(1000)
+    ).mappings().all()
+
+
+MAX_IDENTITY_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IDENTITY_IMAGE_PIXELS = 12_000_000
+
+
+def sanitize_identity_image(upload: UploadFile | None) -> tuple[bytes, str, str] | None:
+    if upload is None:
+        return None
+    content = upload.file.read(MAX_IDENTITY_IMAGE_BYTES + 1)
+    if len(content) > MAX_IDENTITY_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="ID card image must be 5 MB or smaller")
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image_format = image.format
+            width, height = image.size
+            if image_format not in {"JPEG", "PNG"}:
+                raise HTTPException(status_code=415, detail="Upload an ID card image in JPEG or PNG format")
+            if width < 1 or height < 1 or width * height > MAX_IDENTITY_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail="ID card image dimensions exceed the allowed limit")
+            image.verify()
+        with Image.open(io.BytesIO(content)) as image:
+            image.load()
+            oriented_image = ImageOps.exif_transpose(image)
+            clean_image = oriented_image.convert("RGB" if image_format == "JPEG" else "RGBA" if "A" in oriented_image.getbands() else "RGB")
+            output = io.BytesIO()
+            clean_image.save(output, format=image_format, optimize=True)
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, OSError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="The uploaded file is not a valid JPEG or PNG image") from error
+    extension = "jpg" if image_format == "JPEG" else "png"
+    content_type = "image/jpeg" if image_format == "JPEG" else "image/png"
+    clean_content = output.getvalue()
+    if len(clean_content) > MAX_IDENTITY_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Processed ID card image exceeds the 5 MB limit")
+    return clean_content, content_type, extension
+
+
+def create_registration(
+    data: RegistrationIn,
+    db: Session,
+    identity_image: tuple[bytes, str, str] | None = None,
+):
+    email = normalized_email(data.email)
+    username = data.username.strip().casefold()
+    if db.scalar(select(User.id).where(User.username == username)) or db.scalar(
+        select(RegistrationRequest.id).where(RegistrationRequest.username == username)
+    ):
+        raise HTTPException(status_code=409, detail="That username is already in use")
+    if db.scalar(select(User.id).where(User.email == email)) or db.scalar(
+        select(RegistrationRequest.id).where(RegistrationRequest.email == email)
+    ):
+        raise HTTPException(status_code=409, detail="An account or request already uses that email")
+    if data.employee_id and db.scalar(
+        select(EmployeeVerification.id).where(EmployeeVerification.employee_id == data.employee_id.strip())
+    ):
+        raise HTTPException(status_code=409, detail="That employee ID is already under verification")
+    institution = db.get(Institution, data.institution_id) if data.institution_id else None
+    if data.institution_id and not institution:
+        raise HTTPException(status_code=404, detail="Selected institution was not found")
+
+    account_type = data.account_type
+    employee_required = account_type not in {
+        RegistrationAccountType.institution_user,
+        RegistrationAccountType.viewer,
+    }
+    request = RegistrationRequest(
+        public_id=str(uuid.uuid4()),
+        username=username,
+        full_name=data.full_name.strip(),
+        email=email,
+        password_hash=pwd_context.hash(data.password),
+        account_type=account_type.value,
+        organization_name=(institution.name if institution else data.organization_name.strip()),
+        institution_id=institution.id if institution else None,
+        employee_id=data.employee_id.strip() if employee_required and data.employee_id else None,
+        department=data.department.strip(),
+        designation=data.designation.strip(),
+        employee_status="pending" if employee_required else "not_required",
+        institution_status="pending" if account_type == RegistrationAccountType.institution_user else "not_required",
+        status="pending_email_verification",
+    )
+    document_path: Path | None = None
+    if identity_image:
+        image_bytes, content_type, extension = identity_image
+        stored_name = f"identity-{uuid.uuid4().hex}.{extension}"
+        document_path = Path(settings.upload_dir) / stored_name
+        request.identity_document_stored_name = stored_name
+        request.identity_document_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        request.identity_document_content_type = content_type
+        request.identity_document_size = len(image_bytes)
+        request.identity_document_uploaded_at = datetime.now(timezone.utc)
+    db.add(request)
+    db.flush()
+    if employee_required:
+        db.add(EmployeeVerification(
+            registration_id=request.id,
+            employee_id=request.employee_id or "",
+            full_name=request.full_name,
+            official_email=email,
+            organization_name=request.organization_name,
+            department=request.department,
+            designation=request.designation,
+            requested_role=account_type.value,
+        ))
+    token = issue_auth_token(db, "email_verification", registration_id=request.id)
+    add_registration_audit(db, request, None, "registration_submitted", "", "Applicant submitted account request.")
+    if identity_image:
+        add_registration_audit(db, request, None, "identity_document_uploaded", request.status, "Applicant uploaded an ID card image for manual review.")
+    try:
+        if document_path and identity_image:
+            document_path.write_bytes(identity_image[0])
+        db.commit()
+    except (OSError, SQLAlchemyError) as error:
+        db.rollback()
+        if document_path and document_path.is_file():
+            document_path.unlink()
+        raise HTTPException(status_code=500, detail="Registration could not be saved. Please try again.") from error
+    try:
+        delivered = send_account_email(
+            email,
+            "Verify your VaultTrace email",
+            f"Hello {request.full_name},\n\nVerify your email address using this secure link:\n"
+            f"{normalized_base_url(settings.email_verification_base_url or settings.frontend_base_url)}?verifyEmail={token}\n\n"
+            "This confirms control of the email only. It does not verify identity, employment, institution affiliation, or role eligibility.\n",
+        )
+    except (OSError, smtplib.SMTPException):
+        delivered = False
+    return {
+        "registration_id": request.public_id,
+        "status": request.status,
+        "email_delivery": "sent" if delivered else "unavailable",
+        "message": "Check your email to continue." if delivered else "Email delivery is not configured or could not send. Contact your system administrator to enable verification email.",
+    }
+
+
+@app.post("/api/auth/register", status_code=201)
+def register_account(data: RegistrationIn, db: Db):
+    return create_registration(data, db)
+
+
+@app.post("/api/auth/register-with-evidence", status_code=201)
+def register_account_with_evidence(
+    db: Db,
+    registration_data: Annotated[str, Form()],
+    identity_card: Annotated[UploadFile | None, File()] = None,
+):
+    try:
+        data = RegistrationIn.model_validate_json(registration_data)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail="Registration details are invalid") from error
+    identity_image = sanitize_identity_image(identity_card)
+    return create_registration(data, db, identity_image)
+
+
+@app.post("/api/auth/email/verify")
+def verify_registration_email(data: OneTimeTokenIn, db: Db):
+    now = datetime.now(timezone.utc)
+    record = db.scalar(select(AuthTokenRecord).where(
+        AuthTokenRecord.token_hash == token_digest(data.token),
+        AuthTokenRecord.purpose == "email_verification",
+    ).with_for_update())
+    if not record or record.consumed_at or ensure_utc(record.expires_at) <= now or not record.registration_id:
+        raise HTTPException(status_code=400, detail="This verification link is invalid, expired or already used")
+    request = db.get(RegistrationRequest, record.registration_id)
+    if not request or request.status == "rejected":
+        raise HTTPException(status_code=400, detail="This registration cannot be verified")
+    record.consumed_at = now
+    previous = request.status
+    request.email_verified_at = now
+    update_registration_status(request)
+    add_registration_audit(db, request, None, "email_verified", previous, "Applicant verified email ownership.")
+    db.commit()
+    return registration_status_payload(request)
+
+
+@app.post("/api/auth/registration-status/{registration_id}")
+def get_registration_status(registration_id: str, data: RegistrationStatusLookupIn, db: Db):
+    email = normalized_email(data.email)
+    request = db.scalar(select(RegistrationRequest).where(
+        RegistrationRequest.public_id == registration_id,
+        RegistrationRequest.email == email,
+    ))
+    if not request:
+        raise HTTPException(status_code=404, detail="Registration request was not found")
+    return registration_status_payload(request)
+
+
+@app.post("/api/auth/registration-status/{registration_id}/resend")
+def resend_registration_email(registration_id: str, data: RegistrationStatusLookupIn, db: Db):
+    email = normalized_email(data.email)
+    request = db.scalar(select(RegistrationRequest).where(
+        RegistrationRequest.public_id == registration_id,
+        RegistrationRequest.email == email,
+    ))
+    if not request:
+        raise HTTPException(status_code=404, detail="Registration request was not found")
+    if request.email_verified_at or request.status == "rejected":
+        raise HTTPException(status_code=409, detail="This registration cannot resend email verification")
+    now = datetime.now(timezone.utc)
+    for token_record in db.scalars(select(AuthTokenRecord).where(
+        AuthTokenRecord.registration_id == request.id,
+        AuthTokenRecord.purpose == "email_verification",
+        AuthTokenRecord.consumed_at.is_(None),
+    )):
+        token_record.consumed_at = now
+    token = issue_auth_token(db, "email_verification", registration_id=request.id)
+    db.commit()
+    try:
+        delivered = send_account_email(
+            email,
+            "Verify your VaultTrace email",
+            f"Verify your email address using this secure link:\n"
+            f"{normalized_base_url(settings.email_verification_base_url or settings.frontend_base_url)}?verifyEmail={token}\n\n"
+            "This verifies email ownership only.",
+        )
+    except (OSError, smtplib.SMTPException):
+        delivered = False
+    if not delivered:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured or could not send. Contact your system administrator.")
+    return {"message": "A new verification email was sent."}
+
+
+@app.post("/api/auth/registration-status/{registration_id}/resubmit")
+def resubmit_registration(
+    registration_id: str,
+    data: RegistrationResubmitIn,
+    db: Db,
+):
+    email = normalized_email(data.email)
+    request = db.scalar(select(RegistrationRequest).where(
+        RegistrationRequest.public_id == registration_id,
+        RegistrationRequest.email == email,
+    ))
+    if not request or request.status != "rejected":
+        raise HTTPException(status_code=409, detail="This registration is not eligible for resubmission")
+    institution = db.get(Institution, data.institution_id) if data.institution_id else None
+    if data.institution_id and not institution:
+        raise HTTPException(status_code=404, detail="Selected institution was not found")
+    employee_required = RegistrationAccountType(request.account_type) not in {
+        RegistrationAccountType.institution_user,
+        RegistrationAccountType.viewer,
+    }
+    if RegistrationAccountType(request.account_type) == RegistrationAccountType.institution_user and not institution:
+        raise HTTPException(status_code=422, detail="Select the institution you are requesting to join")
+    if employee_required and (
+        not data.employee_id
+        or not data.organization_name.strip()
+        or not data.department.strip()
+        or not data.designation.strip()
+    ):
+        raise HTTPException(status_code=422, detail="Employee ID, organization, department and designation are required")
+    if data.employee_id and data.employee_id.strip() != request.employee_id and db.scalar(
+        select(EmployeeVerification.id).where(EmployeeVerification.employee_id == data.employee_id.strip())
+    ):
+        raise HTTPException(status_code=409, detail="That employee ID is already under verification")
+    previous = request.status
+    request.full_name = data.full_name.strip()
+    request.organization_name = institution.name if institution else data.organization_name.strip()
+    request.institution_id = institution.id if institution else None
+    request.employee_id = data.employee_id.strip() if employee_required and data.employee_id else None
+    request.department = data.department.strip()
+    request.designation = data.designation.strip()
+    request.email_verified_at = None
+    request.identity_status = "pending"
+    request.employee_status = "pending" if employee_required else "not_required"
+    request.institution_status = "pending" if RegistrationAccountType(request.account_type) == RegistrationAccountType.institution_user else "not_required"
+    request.role_status = "pending"
+    request.decision_reason = ""
+    request.decision_actor_id = None
+    request.decision_at = None
+    request.user_id = None
+    update_registration_status(request)
+    employee = db.scalar(select(EmployeeVerification).where(EmployeeVerification.registration_id == request.id))
+    if employee_required:
+        values = {
+            "employee_id": request.employee_id or "",
+            "full_name": request.full_name,
+            "official_email": request.email,
+            "organization_name": request.organization_name,
+            "department": request.department,
+            "designation": request.designation,
+            "requested_role": request.account_type,
+            "method": "manual_review",
+            "status": "pending",
+            "evidence_reference": "",
+            "reviewer_id": None,
+            "reviewed_at": None,
+            "decision_reason": "",
+        }
+        if employee:
+            for key, value in values.items():
+                setattr(employee, key, value)
+        else:
+            db.add(EmployeeVerification(registration_id=request.id, **values))
+    elif employee:
+        db.delete(employee)
+    now = datetime.now(timezone.utc)
+    for token_record in db.scalars(select(AuthTokenRecord).where(
+        AuthTokenRecord.registration_id == request.id,
+        AuthTokenRecord.purpose == "email_verification",
+        AuthTokenRecord.consumed_at.is_(None),
+    )):
+        token_record.consumed_at = now
+    token = issue_auth_token(db, "email_verification", registration_id=request.id)
+    add_registration_audit(db, request, None, "registration_resubmitted", previous, "Applicant resubmitted registration for review.")
+    db.commit()
+    try:
+        delivered = send_account_email(
+            email,
+            "Verify your VaultTrace email",
+            f"Your registration was resubmitted. Verify your email address using this secure link:\n"
+            f"{normalized_base_url(settings.email_verification_base_url or settings.frontend_base_url)}?verifyEmail={token}\n",
+        )
+    except (OSError, smtplib.SMTPException):
+        delivered = False
+    return {
+        "registration_id": request.public_id,
+        "status": request.status,
+        "email_delivery": "sent" if delivered else "unavailable",
+        "message": "Check your email to continue." if delivered else "Email delivery is not configured or could not send. Contact your system administrator.",
+    }
+
+
+@app.post("/api/auth/password-reset/request", status_code=202)
+def request_password_reset(data: PasswordResetRequestIn, db: Db):
+    email = normalized_email(data.email)
+    user = db.scalar(select(User).where(User.email == email, User.active.is_(True)))
+    if user:
+        token = issue_auth_token(db, "password_reset", user_id=user.id)
+        db.commit()
+        try:
+            send_account_email(
+                email,
+                "VaultTrace password reset",
+                f"Reset your VaultTrace password using this one-time link:\n"
+                f"{normalized_base_url(settings.frontend_base_url)}?resetPassword={token}\n\n"
+                "If you did not request this, ignore this email.",
+            )
+        except (OSError, smtplib.SMTPException):
+            return {"message": "If an active account uses that email, password reset instructions will be sent."}
+    return {"message": "If an active account uses that email, password reset instructions will be sent."}
+
+
+@app.post("/api/auth/password-reset/confirm")
+def confirm_password_reset(data: PasswordResetConfirmIn, db: Db):
+    now = datetime.now(timezone.utc)
+    record = db.scalar(select(AuthTokenRecord).where(
+        AuthTokenRecord.token_hash == token_digest(data.token),
+        AuthTokenRecord.purpose == "password_reset",
+    ).with_for_update())
+    if not record or record.consumed_at or ensure_utc(record.expires_at) <= now or not record.user_id:
+        raise HTTPException(status_code=400, detail="This password reset token is invalid, expired or already used")
+    user = db.get(User, record.user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=400, detail="This password reset token is invalid, expired or already used")
+    record.consumed_at = now
+    user.password_hash = pwd_context.hash(data.password)
+    db.add(AuditEvent(actor_id=user.id, action="password_reset", entity="user", entity_id=str(user.id), details="Password reset completed."))
+    db.commit()
+    return {"message": "Password reset complete. Sign in with your new password."}
+
+
+@app.get("/api/auth/github/start", response_model=GitHubOAuthStartOut)
+def start_github_verification(registration_id: str, db: Db):
+    if not settings.github_client_id or not settings.github_client_secret or not settings.github_callback_url:
+        raise HTTPException(status_code=503, detail="GitHub verification is unavailable because OAuth credentials are not configured")
+    request = db.scalar(select(RegistrationRequest).where(RegistrationRequest.public_id == registration_id))
+    if not request or request.status == "rejected":
+        raise HTTPException(status_code=404, detail="An eligible registration request was not found")
+    now = datetime.now(timezone.utc)
+    for previous in db.scalars(select(GithubOAuthState).where(
+        GithubOAuthState.registration_id == request.id,
+        GithubOAuthState.consumed_at.is_(None),
+    )):
+        previous.consumed_at = now
+    state = secrets.token_urlsafe(32)
+    db.add(GithubOAuthState(
+        registration_id=request.id,
+        state_hash=token_digest(state),
+        expires_at=now + timedelta(minutes=10),
+    ))
+    db.commit()
+    params = {
+        "client_id": settings.github_client_id,
+        "redirect_uri": settings.github_callback_url,
+        "scope": "read:user user:email",
+        "state": state,
+    }
+    return {"authorization_url": "https://github.com/login/oauth/authorize?" + str(httpx.QueryParams(params))}
+
+
+@app.get("/api/auth/github/callback")
+def finish_github_verification(db: Db, code: str | None = None, state: str | None = None, error: str | None = None):
+    if not state:
+        raise HTTPException(status_code=400, detail="GitHub verification state is missing")
+    now = datetime.now(timezone.utc)
+    oauth_state = db.scalar(select(GithubOAuthState).where(GithubOAuthState.state_hash == token_digest(state)).with_for_update())
+    if not oauth_state or oauth_state.consumed_at or ensure_utc(oauth_state.expires_at) <= now:
+        raise HTTPException(status_code=400, detail="GitHub verification state is invalid, expired or already used")
+    oauth_state.consumed_at = now
+    db.commit()
+    request = db.get(RegistrationRequest, oauth_state.registration_id)
+    if error or not code:
+        if not request:
+            raise HTTPException(status_code=400, detail="Registration request was not found")
+        return RedirectResponse(
+            f"{normalized_base_url(settings.frontend_base_url)}?registrationId={request.public_id}&github=denied",
+            status_code=303,
+        )
+    if not settings.github_client_id or not settings.github_client_secret or not settings.github_callback_url:
+        raise HTTPException(status_code=503, detail="GitHub verification is not configured")
+    try:
+        with httpx.Client(timeout=10) as client:
+            token_response = client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": settings.github_client_id,
+                    "client_secret": settings.github_client_secret,
+                    "code": code,
+                    "redirect_uri": settings.github_callback_url,
+                    "state": state,
+                },
+            )
+            token_response.raise_for_status()
+            access_token = token_response.json().get("access_token")
+            if not access_token:
+                raise HTTPException(status_code=400, detail="GitHub did not return an access token")
+            profile_response = client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+            )
+            profile_response.raise_for_status()
+            profile = profile_response.json()
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="GitHub verification could not be completed. Try again later.") from error
+    provider_id = profile.get("id")
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="GitHub did not return a valid account identity")
+    if not request or request.status == "rejected":
+        raise HTTPException(status_code=400, detail="Registration request is no longer eligible for verification")
+    request.github_provider_id = str(provider_id)
+    request.github_login = str(profile.get("login", ""))[:100]
+    request.github_verified_at = now
+    db.add(RegistrationAuditEvent(
+        registration_id=request.id,
+        actor_id=None,
+        action="github_account_verified",
+        previous_status=request.status,
+        new_status=request.status,
+        reason="GitHub account ownership checked; no identity or eligibility decision inferred.",
+    ))
+    db.commit()
+    return RedirectResponse(
+        f"{normalized_base_url(settings.frontend_base_url)}?registrationId={request.public_id}&github=verified",
+        status_code=303,
+    )
+
+
+@app.get("/api/admin/registration-requests")
+def list_registration_requests(
+    db: Db,
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))],
+    status: str = "",
+):
+    query = select(RegistrationRequest)
+    if status:
+        query = query.where(RegistrationRequest.status == status)
+    requests = db.scalars(query.order_by(RegistrationRequest.created_at.desc())).all()
+    institution_names = {
+        institution_id: name
+        for institution_id, name in db.execute(
+            select(Institution.id, Institution.name).where(
+                Institution.id.in_({item.institution_id for item in requests if item.institution_id})
+            )
+        ).all()
+    } if any(item.institution_id for item in requests) else {}
+    return [{
+        "id": request.id,
+        "registration_id": request.public_id,
+        "username": request.username,
+        "full_name": request.full_name,
+        "email": request.email,
+        "account_type": request.account_type,
+        "organization_name": request.organization_name,
+        "institution_id": request.institution_id,
+        "institution_name": institution_names.get(request.institution_id),
+        "employee_id": request.employee_id,
+        "department": request.department,
+        "designation": request.designation,
+        "status": request.status,
+        "email_verified_at": request.email_verified_at,
+        "identity_status": request.identity_status,
+        "employee_status": request.employee_status,
+        "institution_status": request.institution_status,
+        "role_status": request.role_status,
+        "github_login": request.github_login,
+        "github_verified_at": request.github_verified_at,
+        "created_at": request.created_at,
+        "decision_reason": request.decision_reason,
+        "decision_at": request.decision_at,
+        "has_identity_document": request.identity_document_stored_name is not None,
+        "identity_document_content_type": request.identity_document_content_type,
+        "identity_document_size": request.identity_document_size,
+    } for request in requests]
+
+
+@app.get("/api/admin/registration-requests/{registration_id}/identity-document")
+def view_registration_identity_document(
+    registration_id: int,
+    db: Db,
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))],
+):
+    registration = db.get(RegistrationRequest, registration_id)
+    if not registration or not registration.identity_document_stored_name:
+        raise HTTPException(status_code=404, detail="No ID card image is available for this registration")
+    upload_root = Path(settings.upload_dir).resolve()
+    document_path = (upload_root / registration.identity_document_stored_name).resolve()
+    if upload_root not in document_path.parents or not document_path.is_file():
+        raise HTTPException(status_code=404, detail="The ID card image could not be found")
+    add_registration_audit(
+        db,
+        registration,
+        user.id,
+        "identity_document_viewed",
+        registration.status,
+        "Authorized reviewer viewed the private ID card image.",
+    )
+    db.commit()
+    return Response(
+        content=document_path.read_bytes(),
+        media_type=registration.identity_document_content_type or "application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": "inline; filename=\"identity-card\"",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/admin/registration-requests/{registration_id}/decision")
+def decide_registration(
+    registration_id: int,
+    data: RegistrationDecisionIn,
+    db: Db,
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))],
+):
+    request = db.get(RegistrationRequest, registration_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="Registration request was not found")
+    if request.status in {"approved", "rejected"}:
+        raise HTTPException(status_code=409, detail="This registration request is already closed")
+    if data.action == "approve_role" and user.role != Role.admin:
+        raise HTTPException(status_code=403, detail="Only an administrator can approve requested account roles")
+
+    now = datetime.now(timezone.utc)
+    previous = request.status
+    if data.action == "reject":
+        request.status = "rejected"
+        request.decision_reason = data.reason.strip()
+        request.decision_actor_id = user.id
+        request.decision_at = now
+        if request.employee_id:
+            employee = db.scalar(select(EmployeeVerification).where(EmployeeVerification.registration_id == request.id))
+            if employee:
+                employee.status = "rejected"
+                employee.reviewer_id = user.id
+                employee.reviewed_at = now
+                employee.decision_reason = data.reason.strip()
+    elif data.action == "verify_identity":
+        if request.email_verified_at is None:
+            raise HTTPException(status_code=409, detail="Email verification must be completed first")
+        if request.identity_status != "pending":
+            raise HTTPException(status_code=409, detail="Identity verification is not pending")
+        request.identity_status = "approved"
+        request.decision_reason = data.reason.strip()
+        request.decision_actor_id = user.id
+        request.decision_at = now
+    elif data.action == "verify_employee":
+        if not request.employee_id or request.employee_status != "pending":
+            raise HTTPException(status_code=409, detail="Employee verification is not pending for this request")
+        employee = db.scalar(select(EmployeeVerification).where(EmployeeVerification.registration_id == request.id))
+        if not employee:
+            raise HTTPException(status_code=409, detail="Employee verification record was not found")
+        employee.status = "approved"
+        employee.method = "authorized_manual_review"
+        employee.evidence_reference = data.evidence_reference.strip()
+        employee.reviewer_id = user.id
+        employee.reviewed_at = now
+        employee.decision_reason = data.reason.strip()
+        request.employee_status = "approved"
+        request.decision_reason = data.reason.strip()
+        request.decision_actor_id = user.id
+        request.decision_at = now
+    elif data.action == "verify_institution":
+        if not request.institution_id or request.institution_status != "pending":
+            raise HTTPException(status_code=409, detail="Institution association is not pending for this request")
+        request.institution_status = "approved"
+        request.decision_reason = data.reason.strip()
+        request.decision_actor_id = user.id
+        request.decision_at = now
+    elif data.action == "approve_role":
+        if request.email_verified_at is None or request.identity_status != "approved":
+            raise HTTPException(status_code=409, detail="Email and identity verification must be completed first")
+        if request.employee_status not in {"approved", "not_required"}:
+            raise HTTPException(status_code=409, detail="Employee verification must be completed first")
+        if request.institution_status not in {"approved", "not_required"}:
+            raise HTTPException(status_code=409, detail="Institution association must be approved first")
+        requested_role = ACCOUNT_TYPE_ROLES[RegistrationAccountType(request.account_type)]
+        if db.scalar(select(User.id).where(User.username == request.username)) or db.scalar(
+            select(User.id).where(User.email == request.email)
+        ):
+            raise HTTPException(status_code=409, detail="Username or email is already assigned to an account")
+        new_user = User(
+            username=request.username,
+            email=request.email,
+            password_hash=request.password_hash,
+            role=requested_role,
+            active=True,
+        )
+        db.add(new_user)
+        db.flush()
+        if request.institution_id:
+            db.add(UserInstitutionMembership(
+                user_id=new_user.id,
+                institution_id=request.institution_id,
+            ))
+        request.user_id = new_user.id
+        request.role_status = "approved"
+        request.decision_reason = data.reason.strip()
+        request.decision_actor_id = user.id
+        request.decision_at = now
+    update_registration_status(request)
+    add_registration_audit(db, request, user.id, data.action, previous, data.reason.strip())
+    db.add(AuditEvent(
+        actor_id=user.id,
+        action=f"registration_{data.action}",
+        entity="registration",
+        entity_id=request.public_id,
+        details=data.reason.strip(),
+    ))
+    db.commit()
+    db.refresh(request)
+    return registration_status_payload(request)
+
+
+@app.get("/api/admin/users", response_model=list[AdminUserOut])
+def list_users(db: Db, user: Annotated[User, Depends(require_roles(Role.admin))]):
+    return db.scalars(select(User).order_by(User.id)).all()
+
+
+@app.patch("/api/admin/users/{user_id}/activation", response_model=AdminUserOut)
+def set_user_activation(
+    user_id: int,
+    data: UserActivationIn,
+    db: Db,
+    user: Annotated[User, Depends(require_roles(Role.admin))],
+):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User was not found")
+    if target.id == user.id and not data.active:
+        raise HTTPException(status_code=409, detail="Administrators cannot suspend their own active session")
+    target.active = data.active
+    db.add(AuditEvent(
+        actor_id=user.id,
+        action="user_activated" if data.active else "user_suspended",
+        entity="user",
+        entity_id=str(target.id),
+        details=data.reason.strip(),
+    ))
+    db.commit()
+    db.refresh(target)
+    return target
 
 
 @app.post("/api/institution-memberships")
@@ -745,10 +1826,18 @@ def create_membership(
 
 
 @app.post("/api/auth/bootstrap", response_model=UserOut)
-def bootstrap(db: Db):
+def bootstrap(db: Db, x_bootstrap_token: Annotated[str | None, Header()] = None):
+    if settings.bootstrap_token:
+        if not x_bootstrap_token or not secrets.compare_digest(x_bootstrap_token, settings.bootstrap_token):
+            raise HTTPException(status_code=403, detail="A valid bootstrap token is required")
+        if not settings.initial_admin_password or len(settings.initial_admin_password) < 12:
+            raise HTTPException(status_code=503, detail="Configure INITIAL_ADMIN_PASSWORD with at least 12 characters before bootstrapping")
+        password = settings.initial_admin_password
+    else:
+        password = "ChangeMe123!"
     if db.scalar(select(func.count(User.id))):
         raise HTTPException(status_code=409, detail="Bootstrap already completed")
-    user = User(username="admin", password_hash=pwd_context.hash("ChangeMe123!"), role=Role.admin)
+    user = User(username="admin", password_hash=pwd_context.hash(password), role=Role.admin)
     db.add(user); db.commit(); db.refresh(user)
     return user
 
@@ -1032,7 +2121,7 @@ def create_fdr_intake(
 
 
 @app.post("/api/fdrs", response_model=FdrOut)
-def create_fdr(data: FdrIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer))]):
+def create_fdr(data: FdrIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.institution_user))]):
     if not db.get(Institution, data.institution_id):
         raise HTTPException(status_code=404, detail="Institution not found")
     require_institution_access(db, user, data.institution_id)
@@ -1064,7 +2153,7 @@ def change_status(fdr_id: int, data: StatusChange, db: Db, user: Annotated[User,
 
 
 @app.post("/api/fdrs/{fdr_id}/documents")
-def upload_document(fdr_id: int, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer))], file: UploadFile = File(...)):
+def upload_document(fdr_id: int, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.institution_user))], file: UploadFile = File(...)):
     require_fdr_access(db, user, fdr_id)
     content_type = file.content_type
     if content_type == "image/jpg":
@@ -1373,7 +2462,390 @@ def add_provenance(fdr_id: int, data: ProvenanceIn, db: Db, user: Annotated[User
 @app.get("/api/fdrs/{fdr_id}/discrepancies")
 def list_discrepancies(fdr_id: int, db: Db, user: Annotated[User, Depends(current_user)]):
     require_fdr_access(db, user, fdr_id)
-    return db.scalars(select(Discrepancy).where(Discrepancy.fdr_id == fdr_id).order_by(Discrepancy.id.desc())).all()
+    return _discrepancy_payloads(db, fdr_id)
+
+
+def _discrepancy_payload(
+    item: Discrepancy,
+    detail: DiscrepancyAnalysisDetail | None,
+    events: list[DiscrepancyReviewEvent],
+    available_document_ids: set[int],
+):
+    return {
+        "id": item.id,
+        "fdr_id": item.fdr_id,
+        "rule_id": item.rule_id,
+        "title": detail.title if detail else item.rule_id,
+        "affected_field": detail.affected_field if detail else "",
+        "severity": item.severity,
+        "explanation": item.explanation,
+        "expected_value": item.expected_value,
+        "expected_source": detail.expected_source if detail else "",
+        "observed_value": item.observed_value,
+        "observed_source": detail.observed_source if detail else "",
+        "evidence_reference": detail.evidence_reference if detail else "",
+        "evidence_document_ids": [
+            int(document_id)
+            for document_id in re.findall(r"Document #(\d+)", detail.evidence_reference if detail else "")
+            if int(document_id) in available_document_ids
+        ],
+        "recommended_action": detail.recommended_action if detail else "",
+        "analysis_method": detail.analysis_method if detail else "manual",
+        "status": item.status.value,
+        "review_status": detail.review_status if detail else (
+            "pending" if item.status == DiscrepancyStatus.open else item.status.value
+        ),
+        "resolution_notes": item.resolution_notes,
+        "created_at": item.created_at,
+        "history": [
+            {
+                "id": event.id,
+                "actor_id": event.actor_id,
+                "action": event.action,
+                "reason": event.reason,
+                "created_at": event.created_at,
+            }
+            for event in events
+        ],
+    }
+
+
+def _discrepancy_payloads(db: Session, fdr_id: int):
+    items = db.scalars(
+        select(Discrepancy).where(Discrepancy.fdr_id == fdr_id).order_by(Discrepancy.id.desc())
+    ).all()
+    ids = [item.id for item in items]
+    available_document_ids = set(db.scalars(select(Document.id).where(Document.fdr_id == fdr_id)).all())
+    details = {
+        detail.discrepancy_id: detail
+        for detail in db.scalars(
+            select(DiscrepancyAnalysisDetail).where(DiscrepancyAnalysisDetail.discrepancy_id.in_(ids))
+        ).all()
+    } if ids else {}
+    events: dict[int, list[DiscrepancyReviewEvent]] = {}
+    if ids:
+        for event in db.scalars(
+            select(DiscrepancyReviewEvent)
+            .where(DiscrepancyReviewEvent.discrepancy_id.in_(ids))
+            .order_by(DiscrepancyReviewEvent.created_at, DiscrepancyReviewEvent.id)
+        ).all():
+            events.setdefault(event.discrepancy_id, []).append(event)
+    return [
+        _discrepancy_payload(item, details.get(item.id), events.get(item.id, []), available_document_ids)
+        for item in items
+    ]
+
+
+def _normalize_analysis_value(field: str, value: str) -> str:
+    if field == "amount":
+        numeric = re.sub(r"[^\d.]", "", value.replace(",", ""))
+        try:
+            return str(Decimal(numeric).normalize())
+        except InvalidOperation:
+            return numeric
+    if field in {"issue_date", "maturity_date"}:
+        return _candidate_date(value) or value.strip().casefold()
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _ocr_fields(text: str) -> dict[str, str]:
+    candidates = _affidavit_candidates(text)
+    labels = {
+        "identifier": [r"FDR\s*(?:no\.?|number|id)", r"FD\s*(?:no\.?|number|id)", r"certificate\s*(?:no\.?|number|id)"],
+        "holder_name": [r"holder\s*name", r"name\s*of\s*depositor", r"depositor\s*name"],
+        "institution_name": [r"institution\s*name", r"name\s*of\s*institution"],
+        "amount": [r"principal\s*amount", r"deposit\s*amount", r"amount"],
+        "issue_date": [r"date\s*of\s*issue", r"issue\s*date"],
+        "maturity_date": [r"date\s*of\s*maturity", r"maturity\s*date", r"due\s*date"],
+        "beneficiary": [r"beneficiary", r"in\s*favour\s*of", r"in\s*favor\s*of"],
+        "bank_name": [r"issuing\s*bank", r"bank\s*name", r"bank"],
+    }
+    fields = {}
+    for field, field_labels in labels.items():
+        value = _extracted_label(text, field_labels) or candidates.get(field, "")
+        value = value.strip()
+        if field == "amount":
+            value = re.sub(r"[^\d,.]", "", value)
+        elif field in {"issue_date", "maturity_date"}:
+            value = _candidate_date(value)
+        if value:
+            fields[field] = value
+    return fields
+
+
+def _analyze_fdr_discrepancies(db: Session, fdr: Fdr) -> list[Discrepancy]:
+    findings: list[Discrepancy] = []
+
+    def record(
+        rule: str,
+        title: str,
+        field: str,
+        severity: str,
+        explanation: str,
+        expected: str = "",
+        observed: str = "",
+        expected_source: str = "",
+        observed_source: str = "",
+        evidence_reference: str = "",
+        recommended_action: str = "",
+    ) -> None:
+        rule_id = f"AUTO:{rule}"
+        item = db.scalar(
+            select(Discrepancy).where(Discrepancy.fdr_id == fdr.id, Discrepancy.rule_id == rule_id)
+        )
+        if not item:
+            item = Discrepancy(
+                fdr_id=fdr.id,
+                rule_id=rule_id,
+                severity=severity,
+                explanation=explanation,
+                expected_value=expected,
+                observed_value=observed,
+            )
+            db.add(item)
+            db.flush()
+        else:
+            item.severity = severity
+            item.explanation = explanation
+            item.expected_value = expected
+            item.observed_value = observed
+        detail = db.get(DiscrepancyAnalysisDetail, item.id)
+        if not detail:
+            detail = DiscrepancyAnalysisDetail(discrepancy_id=item.id)
+            db.add(detail)
+        detail.title = title
+        detail.affected_field = field
+        detail.expected_source = expected_source
+        detail.observed_source = observed_source
+        detail.evidence_reference = evidence_reference
+        detail.recommended_action = recommended_action
+        detail.analysis_method = "rule_based"
+        findings.append(item)
+
+    stored_fields = [
+        ("identifier", fdr.identifier, "FDR master record", "High"),
+        ("holder_name", fdr.holder_name, "FDR master record", "High"),
+        ("approval_case_reference", fdr.approval_case_reference or "", "FDR master record", "Medium"),
+        ("amount", str(fdr.amount) if fdr.amount is not None else "", "FDR master record", "Critical"),
+        ("amount_in_words", fdr.amount_in_words or "", "FDR master record", "Medium"),
+        ("issue_date", fdr.issue_date.date().isoformat() if fdr.issue_date else "", "FDR master record", "Medium"),
+        ("maturity_date", fdr.maturity_date.date().isoformat() if fdr.maturity_date else "", "FDR master record", "Medium"),
+        ("bank_name", fdr.bank_name or "", "FDR master record", "Medium"),
+        ("branch_name", fdr.branch_name or "", "FDR master record", "Medium"),
+        ("ifsc_code", fdr.ifsc_code or "", "FDR master record", "Medium"),
+        ("beneficiary", fdr.beneficiary or "", "FDR master record", "Medium"),
+        ("joint_holder", fdr.joint_holder or "", "FDR master record", "Medium"),
+        ("institution_name", fdr.institution.name if fdr.institution else "", "Institution directory", "High"),
+    ]
+    for field, value, source, severity in stored_fields:
+        if not value.strip():
+            record(
+                f"MISSING_FIELD:{field}",
+                f"Missing {field.replace('_', ' ')}",
+                field,
+                severity,
+                f"The {field.replace('_', ' ')} is not present in the {source.lower()}.",
+                observed="Missing",
+                observed_source=source,
+                recommended_action="Review the source instrument and complete this field if the evidence supports it.",
+            )
+
+    provenance_fields = {
+        "identifier": (fdr.identifier, "FDR master record"),
+        "holder_name": (fdr.holder_name, "FDR master record"),
+        "amount": (str(fdr.amount), "FDR master record"),
+        "issue_date": (fdr.issue_date.date().isoformat() if fdr.issue_date else "", "FDR master record"),
+        "maturity_date": (fdr.maturity_date.date().isoformat() if fdr.maturity_date else "", "FDR master record"),
+        "bank_name": (fdr.bank_name or "", "FDR master record"),
+        "beneficiary": (fdr.beneficiary or "", "FDR master record"),
+        "institution_name": (fdr.institution.name if fdr.institution else "", "Institution directory"),
+    }
+    provenance_records = db.scalars(
+        select(FieldProvenance).where(FieldProvenance.fdr_id == fdr.id).order_by(FieldProvenance.id)
+    ).all()
+    for provenance in provenance_records:
+        expected, expected_source = provenance_fields.get(provenance.field_name, ("", ""))
+        if not expected or _normalize_analysis_value(provenance.field_name, expected) == _normalize_analysis_value(provenance.field_name, provenance.value):
+            continue
+        evidence = f"Document #{provenance.source_document_id}" if provenance.source_document_id else provenance.evidence_reference
+        record(
+            f"PROVENANCE_CONFLICT:{provenance.id}",
+            f"Reviewed provenance conflicts for {provenance.field_name.replace('_', ' ')}",
+            provenance.field_name,
+            "High" if provenance.level == ProvenanceLevel.independently_confirmed else "Medium",
+            "A stored provenance value differs from the current instrument or institution record.",
+            expected=expected,
+            observed=provenance.value,
+            expected_source=expected_source,
+            observed_source=f"Field provenance {provenance.level.value}",
+            evidence_reference=evidence,
+            recommended_action="Review the provenance source and reconcile the conflicting records before making a decision.",
+        )
+
+    if fdr.issue_date and fdr.maturity_date and fdr.maturity_date <= fdr.issue_date:
+        record(
+            "DATE_ORDER",
+            "Inconsistent issue and maturity dates",
+            "issue_date / maturity_date",
+            "High",
+            "The stored maturity date is not later than the stored issue date.",
+            expected="Maturity date after issue date",
+            observed=f"{fdr.issue_date.date().isoformat()} / {fdr.maturity_date.date().isoformat()}",
+            expected_source="FDR date rule",
+            observed_source="FDR master record",
+            recommended_action="Check both dates against the original instrument before updating the record.",
+        )
+
+    duplicates = db.scalars(
+        select(Fdr).where(func.lower(Fdr.identifier) == fdr.identifier.casefold(), Fdr.id != fdr.id)
+    ).all()
+    for duplicate in duplicates:
+        record(
+            f"DUPLICATE_IDENTIFIER:{duplicate.id}",
+            "Duplicate instrument reference",
+            "identifier",
+            "High",
+            f"The instrument reference matches another stored FDR record (#{duplicate.id}).",
+            expected=f"Unique instrument reference",
+            observed=fdr.identifier,
+            expected_source="FDR registry",
+            observed_source=f"FDR records #{fdr.id} and #{duplicate.id}",
+            evidence_reference=f"Related FDR record #{duplicate.id}",
+            recommended_action="Compare both records and confirm whether one is a duplicate or a separate instrument.",
+        )
+
+    documents = db.scalars(
+        select(Document).where(Document.fdr_id == fdr.id).order_by(Document.id)
+    ).all()
+    if not documents:
+        record(
+            "MISSING_SUPPORTING_DOCUMENT",
+            "No supporting document attached",
+            "supporting_evidence",
+            "Medium",
+            "No document record is attached to this instrument, so document-based comparisons were unavailable.",
+            observed="No attached documents",
+            observed_source="VaultTrace document records",
+            recommended_action="Request and attach the supporting instrument document for review.",
+        )
+
+    extraction_rows = db.scalars(
+        select(ExtractionResult)
+        .join(Document, ExtractionResult.document_id == Document.id)
+        .where(Document.fdr_id == fdr.id)
+        .order_by(ExtractionResult.document_id, ExtractionResult.id)
+    ).all()
+    latest_extractions: dict[int, ExtractionResult] = {}
+    for extraction in extraction_rows:
+        latest_extractions[extraction.document_id] = extraction
+
+    ocr_values: dict[str, list[tuple[str, str, str]]] = {}
+    for document in documents:
+        evidence = f"Document #{document.id}: {document.original_name}; SHA-256 {document.sha256}"
+        content_path = (Path(settings.upload_dir) / document.stored_name).resolve()
+        upload_root = Path(settings.upload_dir).resolve()
+        try:
+            if upload_root not in content_path.parents or not content_path.is_file():
+                raise OSError("Document content unavailable")
+            actual_hash = hashlib.sha256(content_path.read_bytes()).hexdigest()
+        except OSError:
+            record(
+                f"DOCUMENT_CONTENT_UNAVAILABLE:{document.id}",
+                "Document content unavailable",
+                "document_integrity",
+                "High",
+                "VaultTrace has a document record and stored fingerprint, but the document bytes could not be read for verification.",
+                expected=document.sha256,
+                observed="Unavailable",
+                expected_source="Stored document fingerprint",
+                observed_source=f"Document storage for document #{document.id}",
+                evidence_reference=evidence,
+                recommended_action="Restore or re-upload the document through the authorised evidence workflow, then review its fingerprint.",
+            )
+        else:
+            if actual_hash != document.sha256:
+                record(
+                    f"DOCUMENT_HASH_MISMATCH:{document.id}",
+                    "Document fingerprint mismatch",
+                    "document_integrity",
+                    "Critical",
+                    "The document bytes do not match the SHA-256 fingerprint recorded at upload.",
+                    expected=document.sha256,
+                    observed=actual_hash,
+                    expected_source="Stored document fingerprint",
+                    observed_source=f"Current document bytes for document #{document.id}",
+                    evidence_reference=evidence,
+                    recommended_action="Quarantine this evidence for review and verify the original through an authorised process.",
+                )
+        extraction = latest_extractions.get(document.id)
+        if not extraction or extraction.status != "completed":
+            record(
+                f"OCR_NOT_AVAILABLE:{document.id}",
+                "Document has no completed text extraction",
+                "extracted_fields",
+                "Informational",
+                "No completed OCR/text extraction is available for this attached document; no OCR field comparison was made.",
+                observed=extraction.status if extraction else "No extraction record",
+                expected_source="Completed document extraction",
+                observed_source=f"Document #{document.id}",
+                evidence_reference=evidence,
+                recommended_action="Run the existing local document extraction workflow if this document needs field comparison.",
+            )
+            continue
+        fields = _ocr_fields(extraction.extracted_text or "")
+        source = f"OCR ({extraction.provider}) · document #{document.id}"
+        comparisons = {
+            "identifier": (fdr.identifier, "FDR master record"),
+            "holder_name": (fdr.holder_name, "FDR master record"),
+            "amount": (str(fdr.amount), "FDR master record"),
+            "issue_date": (fdr.issue_date.date().isoformat() if fdr.issue_date else "", "FDR master record"),
+            "maturity_date": (fdr.maturity_date.date().isoformat() if fdr.maturity_date else "", "FDR master record"),
+            "bank_name": (fdr.bank_name or "", "FDR master record"),
+            "beneficiary": (fdr.beneficiary or "", "FDR master record"),
+            "institution_name": (fdr.institution.name if fdr.institution else "", "Institution directory"),
+        }
+        for field, observed in fields.items():
+            expected, expected_source = comparisons[field]
+            ocr_values.setdefault(field, []).append((observed, source, evidence))
+            if not expected or _normalize_analysis_value(field, expected) == _normalize_analysis_value(field, observed):
+                continue
+            severity = "Critical" if field == "amount" else "High" if field in {"identifier", "holder_name", "institution_name"} else "Medium"
+            record(
+                f"OCR_MISMATCH:{field}:{document.id}",
+                f"{field.replace('_', ' ').capitalize()} differs from the stored record",
+                field,
+                severity,
+                f"The value extracted from the document differs from the value in the {expected_source.lower()}.",
+                expected=expected,
+                observed=observed,
+                expected_source=expected_source,
+                observed_source=source,
+                evidence_reference=evidence,
+                recommended_action="Compare the cited OCR value with the original document and correct the record only when supported.",
+            )
+
+    for field, values in ocr_values.items():
+        if len(values) < 2:
+            continue
+        baseline, baseline_source, baseline_evidence = values[0]
+        for observed, observed_source, observed_evidence in values[1:]:
+            if _normalize_analysis_value(field, baseline) == _normalize_analysis_value(field, observed):
+                continue
+            record(
+                f"OCR_CONFLICT:{field}:{baseline_source.rsplit('#', 1)[-1]}:{observed_source.rsplit('#', 1)[-1]}",
+                f"Conflicting extracted {field.replace('_', ' ')} values",
+                field,
+                "High" if field in {"identifier", "amount", "institution_name"} else "Medium",
+                "Two attached documents have different extracted values for the same field.",
+                expected=baseline,
+                observed=observed,
+                expected_source=baseline_source,
+                observed_source=observed_source,
+                evidence_reference=f"{baseline_evidence}; {observed_evidence}",
+                recommended_action="Review both cited documents and determine which value, if either, is supported.",
+            )
+
+    return findings
 
 
 @app.post("/api/fdrs/{fdr_id}/discrepancies")
@@ -1384,6 +2856,201 @@ def create_discrepancy(fdr_id: int, data: DiscrepancyIn, db: Db, user: Annotated
     return item
 
 
+@app.post("/api/fdrs/{fdr_id}/discrepancies/analyze")
+def analyze_discrepancies(
+    fdr_id: int,
+    db: Db,
+    user: Annotated[User, Depends(current_user)],
+):
+    fdr = require_fdr_access(db, user, fdr_id)
+    _analyze_fdr_discrepancies(db, fdr)
+    db.add(AuditEvent(
+        actor_id=user.id,
+        action="discrepancy_analysis",
+        entity="fdr",
+        entity_id=str(fdr_id),
+        details="rule_based",
+    ))
+    db.commit()
+    payloads = _discrepancy_payloads(db, fdr_id)
+    return {
+        "fdr_id": fdr_id,
+        "analysis_method": "rule_based",
+        "summary": {
+            "findings": len(payloads),
+            "open": sum(1 for finding in payloads if finding["status"] == "open" and finding["review_status"] != "dismissed"),
+        },
+        "findings": payloads,
+    }
+
+
+@app.post("/api/fdrs/{fdr_id}/discrepancies/chat")
+def ask_discrepancy_assistant(
+    fdr_id: int,
+    data: DiscrepancyChatIn,
+    db: Db,
+    user: Annotated[User, Depends(current_user)],
+):
+    fdr = require_fdr_access(db, user, fdr_id)
+    _analyze_fdr_discrepancies(db, fdr)
+    findings = _discrepancy_payloads(db, fdr_id)
+    question = data.question.strip()
+    normalized_question = question.casefold()
+    field_terms = {
+        "amount": {"amount", "principal", "value", "sum"},
+        "identifier": {"identifier", "reference", "number", "fdr"},
+        "holder_name": {"holder", "depositor"},
+        "institution_name": {"institution", "college", "name"},
+        "issue_date": {"issue", "issued"},
+        "maturity_date": {"maturity", "mature", "due"},
+        "document_integrity": {"hash", "fingerprint", "integrity"},
+        "supporting_evidence": {"document", "evidence", "ocr", "extracted"},
+        "bank_name": {"bank"},
+        "beneficiary": {"beneficiary"},
+    }
+    words = set(re.findall(r"[a-z0-9]+", normalized_question))
+    selected_fields = {
+        field for field, terms in field_terms.items() if words.intersection(terms)
+    }
+    if "date" in words:
+        selected_fields.update({"issue_date", "maturity_date"})
+    asks_summary = bool(words.intersection({"summary", "summarize", "overall", "findings", "discrepancies", "issues"}))
+
+    matching = [
+        finding for finding in findings
+        if asks_summary or finding["affected_field"] in selected_fields
+    ]
+    if not matching and not selected_fields:
+        matching = findings[:5]
+
+    sources = [f"FDR master record #{fdr.id}"]
+    response_lines: list[str] = []
+    if selected_fields == {"amount"}:
+        response_lines.append(f"The recorded principal is {fdr.amount:,.2f} in the FDR master record.")
+    elif selected_fields.intersection({"identifier", "holder_name", "institution_name", "issue_date", "maturity_date", "bank_name", "beneficiary"}):
+        stored_values = {
+            "identifier": ("Instrument reference", fdr.identifier),
+            "holder_name": ("Holder", fdr.holder_name),
+            "institution_name": ("Institution", fdr.institution.name if fdr.institution else ""),
+            "issue_date": ("Issue date", fdr.issue_date.date().isoformat() if fdr.issue_date else ""),
+            "maturity_date": ("Maturity date", fdr.maturity_date.date().isoformat() if fdr.maturity_date else ""),
+            "bank_name": ("Bank", fdr.bank_name or ""),
+            "beneficiary": ("Beneficiary", fdr.beneficiary or ""),
+        }
+        for field in selected_fields:
+            if field in stored_values and stored_values[field][1]:
+                label, value = stored_values[field]
+                response_lines.append(f"{label}: {value}.")
+
+    if not matching:
+        if findings:
+            response_lines.append(
+                "I found no field-specific discrepancy finding for that question. "
+                "That does not confirm the field was checked or that its values match; review the cited records. "
+                "It does not establish authenticity."
+            )
+        else:
+            response_lines.append(
+                "No discrepancies were detected in the records available for analysis. "
+                "This does not establish the instrument’s authenticity."
+            )
+    else:
+        response_lines.append("Here is what the available VaultTrace analysis shows:")
+        for finding in matching[:5]:
+            expected = finding["expected_value"] or "not available"
+            observed = finding["observed_value"] or "not available"
+            line = (
+                f"Finding #{finding['id']} ({finding['severity']}): {finding['title']}. "
+                f"{finding['explanation']} Expected: {expected}"
+            )
+            if finding["expected_source"]:
+                line += f" ({finding['expected_source']})"
+            line += f"; observed: {observed}"
+            if finding["observed_source"]:
+                line += f" ({finding['observed_source']})"
+            line += "."
+            if finding["recommended_action"]:
+                line += f" Recommended action: {finding['recommended_action']}"
+            response_lines.append(line)
+            sources.append(f"Finding #{finding['id']}")
+            sources.extend(
+                source
+                for source in (finding["expected_source"], finding["observed_source"])
+                if source
+            )
+            sources.extend(
+                f"Document #{document_id}"
+                for document_id in finding["evidence_document_ids"]
+            )
+        if len(matching) > 5:
+            response_lines.append(f"{len(matching) - 5} additional matching findings are shown in the findings list.")
+
+    db.add(AuditEvent(
+        actor_id=user.id,
+        action="discrepancy_chat_question",
+        entity="fdr",
+        entity_id=str(fdr_id),
+        details="rule_based",
+    ))
+    db.commit()
+    return {
+        "fdr_id": fdr_id,
+        "analysis_method": "rule_based",
+        "reply": "\n\n".join(response_lines),
+        "sources": list(dict.fromkeys(sources)),
+    }
+
+
+@app.post("/api/discrepancies/{discrepancy_id}/review")
+def review_discrepancy(
+    discrepancy_id: int,
+    data: DiscrepancyReviewIn,
+    db: Db,
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))],
+):
+    item = db.get(Discrepancy, discrepancy_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Discrepancy not found")
+    require_fdr_access(db, user, item.fdr_id)
+    if item.status == DiscrepancyStatus.waived and user.role != Role.admin and data.action != DiscrepancyReviewAction.add_note:
+        raise HTTPException(status_code=403, detail="Only administrators can reopen a waived discrepancy")
+    detail = db.get(DiscrepancyAnalysisDetail, item.id)
+    if not detail:
+        detail = DiscrepancyAnalysisDetail(discrepancy_id=item.id)
+        db.add(detail)
+    review_status = {
+        DiscrepancyReviewAction.mark_reviewed: "reviewed",
+        DiscrepancyReviewAction.confirm: "confirmed",
+        DiscrepancyReviewAction.dismiss: "dismissed",
+        DiscrepancyReviewAction.request_evidence: "evidence_requested",
+        DiscrepancyReviewAction.escalate: "escalated",
+    }
+    if data.action in review_status:
+        detail.review_status = review_status[data.action]
+    if data.action == DiscrepancyReviewAction.dismiss:
+        item.status = DiscrepancyStatus.resolved
+        item.resolved_by = user.id
+    elif data.action != DiscrepancyReviewAction.add_note and item.status != DiscrepancyStatus.open:
+        item.status = DiscrepancyStatus.open
+        item.resolved_by = None
+    item.resolution_notes = data.reason
+    db.add(DiscrepancyReviewEvent(
+        discrepancy_id=item.id,
+        actor_id=user.id,
+        action=data.action.value,
+        reason=data.reason,
+    ))
+    db.add(AuditEvent(
+        actor_id=user.id,
+        action="discrepancy_review",
+        entity="discrepancy",
+        entity_id=str(item.id),
+        details=data.action.value,
+    ))
+    db.commit()
+    return next(finding for finding in _discrepancy_payloads(db, item.fdr_id) if finding["id"] == item.id)
+
+
 @app.patch("/api/discrepancies/{discrepancy_id}")
 def resolve_discrepancy(discrepancy_id: int, data: ResolutionIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))]):
     item = db.get(Discrepancy, discrepancy_id)
@@ -1391,13 +3058,30 @@ def resolve_discrepancy(discrepancy_id: int, data: ResolutionIn, db: Db, user: A
         raise HTTPException(status_code=404, detail="Discrepancy not found")
     if data.status == DiscrepancyStatus.waived and user.role != Role.admin:
         raise HTTPException(status_code=403, detail="Only administrators can waive discrepancies")
+    require_fdr_access(db, user, item.fdr_id)
     item.status = data.status; item.resolution_notes = data.resolution_notes; item.resolved_by = user.id
+    detail = db.get(DiscrepancyAnalysisDetail, item.id)
+    if not detail:
+        detail = DiscrepancyAnalysisDetail(discrepancy_id=item.id)
+        db.add(detail)
+    if data.status == DiscrepancyStatus.resolved:
+        detail.review_status = "resolved"
+    elif data.status == DiscrepancyStatus.waived:
+        detail.review_status = "dismissed"
+    db.add(DiscrepancyReviewEvent(
+        discrepancy_id=item.id,
+        actor_id=user.id,
+        action="resolve" if data.status == DiscrepancyStatus.resolved else "waive",
+        reason=data.resolution_notes,
+    ))
     db.add(AuditEvent(actor_id=user.id, action="discrepancy_resolved", entity="discrepancy", entity_id=str(item.id), details=data.status.value)); db.commit()
-    return item
+    return next(
+        finding for finding in _discrepancy_payloads(db, item.fdr_id) if finding["id"] == item.id
+    )
 
 
 @app.post("/api/fdrs/{fdr_id}/verification")
-def update_verification(fdr_id: int, data: VerificationIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer))]):
+def update_verification(fdr_id: int, data: VerificationIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.reviewer, Role.verification_officer))]):
     fdr = require_fdr_access(db, user, fdr_id)
     if data.status in {VerificationStatus.verified, VerificationStatus.rejected} and len(data.evidence_reference.strip()) < 3:
         raise HTTPException(status_code=422, detail="Evidence reference is required for a terminal verification decision")
@@ -1482,7 +3166,7 @@ def request_renewal_or_replacement(
 
 
 @app.post("/api/fdrs/{fdr_id}/release-requests")
-def request_release(fdr_id: int, data: ReleaseRequestIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer))]):
+def request_release(fdr_id: int, data: ReleaseRequestIn, db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.institution_user))]):
     fdr = require_fdr_access(db, user, fdr_id)
     if fdr.status != FdrStatus.verified:
         raise HTTPException(status_code=422, detail="FDR must be verified before release or refund request")
@@ -1513,7 +3197,7 @@ def decide_release(request_id: int, data: DecisionIn, db: Db, user: Annotated[Us
 
 
 @app.get("/api/release-requests")
-def list_release_requests(db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.auditor))]):
+def list_release_requests(db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.auditor, Role.institution_user))]):
     query = select(ReleaseRequest).order_by(ReleaseRequest.id.desc())
     if user.role not in {Role.admin, Role.auditor}:
         query = query.join(Fdr, Fdr.id == ReleaseRequest.fdr_id).join(
@@ -1604,11 +3288,11 @@ def list_custody_events(fdr_id: int, db: Db, user: Annotated[User, Depends(curre
 @app.get("/api/maturity")
 def maturity_calendar(db: Db, user: Annotated[User, Depends(current_user)], days: int = 90):
     horizon = datetime.now(timezone.utc) + timedelta(days=max(1, min(days, 730)))
-    query = select(Fdr).where(Fdr.maturity_date <= horizon, Fdr.status.not_in([FdrStatus.closed, FdrStatus.rejected]))
+    query = select(Fdr, Institution.name).join(Institution, Institution.id == Fdr.institution_id).where(Fdr.maturity_date <= horizon, Fdr.status.not_in([FdrStatus.closed, FdrStatus.rejected]))
     if user.role not in {Role.admin, Role.auditor}:
         query = query.join(UserInstitutionMembership, UserInstitutionMembership.institution_id == Fdr.institution_id).where(UserInstitutionMembership.user_id == user.id)
-    rows = db.scalars(query.order_by(Fdr.maturity_date)).all()
-    return [{"id": row.id, "identifier": row.identifier, "maturity_date": row.maturity_date, "status": row.status.value, "days_remaining": ((row.maturity_date.replace(tzinfo=timezone.utc) if row.maturity_date.tzinfo is None else row.maturity_date) - datetime.now(timezone.utc)).days} for row in rows]
+    rows = db.execute(query.order_by(Fdr.maturity_date)).all()
+    return [{"id": row.id, "identifier": row.identifier, "institution_id": row.institution_id, "institution_name": institution_name, "maturity_date": row.maturity_date, "status": row.status.value, "days_remaining": ((row.maturity_date.replace(tzinfo=timezone.utc) if row.maturity_date.tzinfo is None else row.maturity_date) - datetime.now(timezone.utc)).days} for row, institution_name in rows]
 
 
 @app.post("/api/fdrs/{fdr_id}/notifications")

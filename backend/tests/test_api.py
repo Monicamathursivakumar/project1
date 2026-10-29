@@ -1,9 +1,15 @@
 from fastapi.testclient import TestClient
-from app.main import app, Document, ExtractionResult, Fdr, Institution, ReleaseRequest, Role, SessionLocal, User, UserInstitutionMembership, pwd_context, select
+import app.main as main
+from app.main import app, AuthTokenRecord, Document, EmployeeVerification, ExtractionResult, Fdr, Institution, RegistrationAuditEvent, ReleaseRequest, Role, SessionLocal, User, UserInstitutionMembership, pwd_context, select, settings, token_digest
 from datetime import datetime, timezone
 import io
+import json
+import re
 import uuid
 import fitz
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 client = TestClient(app)
 def test_health(): assert client.get("/health").json()["status"] == "ok"
@@ -13,6 +19,403 @@ def test_bootstrap_and_auth():
     response = client.post("/api/auth/token", data={"username": "admin", "password": "ChangeMe123!"})
     assert response.status_code == 200
     assert response.json()["token_type"] == "bearer"
+
+
+def register_request(monkeypatch, account_type="viewer", **overrides):
+    suffix = uuid.uuid4().hex[:10]
+    sent_messages = []
+    monkeypatch.setattr(main, "send_account_email", lambda recipient, subject, body: sent_messages.append(body) or True)
+    payload = {
+        "username": f"register-{suffix}",
+        "full_name": "Registration Example",
+        "email": f"register-{suffix}@example.test",
+        "password": "VaultTraceTest!123",
+        "password_confirmation": "VaultTraceTest!123",
+        "account_type": account_type,
+        "organization_name": "",
+        "institution_id": None,
+        "employee_id": None,
+        "department": "",
+        "designation": "",
+        "consent": True,
+    }
+    if account_type not in {"institution_user", "viewer"}:
+        payload.update({
+            "organization_name": "VaultTrace Demo Organization",
+            "employee_id": f"EMP-{suffix}",
+            "department": "Operations",
+            "designation": "Officer",
+        })
+    payload.update(overrides)
+    response = client.post("/api/auth/register", json=payload)
+    token = None
+    if response.status_code == 201 and sent_messages:
+        match = re.search(r"[?&]verifyEmail=([A-Za-z0-9_-]+)", sent_messages[-1])
+        token = match.group(1) if match else None
+    return response, token, payload
+
+
+def verify_email(token):
+    return client.post("/api/auth/email/verify", json={"token": token})
+
+
+def decide_registration(headers, registration_db_id, action, reason="Reviewed registration evidence."):
+    return client.post(
+        f"/api/admin/registration-requests/{registration_db_id}/decision",
+        headers=headers,
+        json={"action": action, "reason": reason},
+    )
+
+
+def test_registration_email_identity_role_approval_and_audit(monkeypatch):
+    registered, token, payload = register_request(monkeypatch)
+    assert registered.status_code == 201
+    assert token
+    registration_id = registered.json()["registration_id"]
+
+    before_approval = client.post(
+        "/api/auth/token",
+        data={"username": payload["username"], "password": payload["password"]},
+    )
+    assert before_approval.status_code == 401
+
+    verified = verify_email(token)
+    assert verified.status_code == 200
+    assert verified.json()["status"] == "pending_identity_verification"
+    assert verify_email(token).status_code == 400
+
+    with SessionLocal() as db:
+        request = db.scalar(select(main.RegistrationRequest).where(main.RegistrationRequest.public_id == registration_id))
+        assert request is not None
+        request_id = request.id
+        reviewer = User(
+            username=f"reviewer-{uuid.uuid4().hex[:8]}",
+            password_hash=pwd_context.hash("ReviewerPassword123!"),
+            role=Role.reviewer,
+        )
+        db.add(reviewer)
+        db.commit()
+        reviewer_name = reviewer.username
+
+    reviewer_token = client.post("/api/auth/token", data={"username": reviewer_name, "password": "ReviewerPassword123!"})
+    reviewer_headers = {"Authorization": f"Bearer {reviewer_token.json()['access_token']}"}
+    cannot_grant_role = decide_registration(reviewer_headers, request_id, "approve_role")
+    assert cannot_grant_role.status_code == 403
+
+    admin_headers = auth_headers()
+    assert decide_registration(admin_headers, request_id, "verify_identity").status_code == 200
+    approved = decide_registration(admin_headers, request_id, "approve_role")
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    login = client.post(
+        "/api/auth/token",
+        data={"username": payload["username"], "password": payload["password"]},
+    )
+    assert login.status_code == 200
+
+    with SessionLocal() as db:
+        events = db.scalars(select(RegistrationAuditEvent).where(RegistrationAuditEvent.registration_id == request_id)).all()
+        actions = {event.action for event in events}
+        assert {"registration_submitted", "email_verified", "verify_identity", "approve_role"} <= actions
+        registration = db.get(main.RegistrationRequest, request_id)
+        user_id = registration.user_id
+
+    suspended = client.patch(
+        f"/api/admin/users/{user_id}/activation",
+        headers=admin_headers,
+        json={"active": False, "reason": "Suspension workflow test."},
+    )
+    assert suspended.status_code == 200
+    suspended_login = client.post(
+        "/api/auth/token",
+        data={"username": payload["username"], "password": payload["password"]},
+    )
+    assert suspended_login.status_code == 401
+
+
+def test_registration_rejects_invalid_and_duplicate_accounts(monkeypatch):
+    invalid, _, _ = register_request(
+        monkeypatch,
+        password_confirmation="DifferentVaultTracePassword123!",
+    )
+    assert invalid.status_code == 422
+
+    registered, _, payload = register_request(monkeypatch)
+    assert registered.status_code == 201
+    duplicate_username, _, _ = register_request(
+        monkeypatch,
+        username=payload["username"],
+    )
+    assert duplicate_username.status_code == 409
+    duplicate_email, _, _ = register_request(
+        monkeypatch,
+        email=payload["email"],
+    )
+    assert duplicate_email.status_code == 409
+
+
+def test_rejected_registration_requires_reason_and_stays_inactive(monkeypatch):
+    registered, _, payload = register_request(monkeypatch)
+    assert registered.status_code == 201
+    registration_id = registered.json()["registration_id"]
+    with SessionLocal() as db:
+        request = db.scalar(select(main.RegistrationRequest).where(
+            main.RegistrationRequest.public_id == registration_id,
+        ))
+        request_id = request.id
+
+    admin_headers = auth_headers()
+    missing_reason = client.post(
+        f"/api/admin/registration-requests/{request_id}/decision",
+        headers=admin_headers,
+        json={"action": "reject", "reason": ""},
+    )
+    assert missing_reason.status_code == 422
+    rejected = decide_registration(admin_headers, request_id, "reject", "Unable to verify the submitted organization.")
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    login = client.post(
+        "/api/auth/token",
+        data={"username": payload["username"], "password": payload["password"]},
+    )
+    assert login.status_code == 401
+
+
+def test_registration_id_card_is_private_and_reviewer_access_is_audited(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr(main, "send_account_email", lambda recipient, subject, body: True)
+    suffix = uuid.uuid4().hex[:10]
+    with SessionLocal() as db:
+        institution_name = f"Review Institution {suffix}"
+        institution = Institution(name=institution_name, code=f"REVIEW-{suffix}")
+        db.add(institution)
+        db.commit()
+        institution_id = institution.id
+    payload = {
+        "username": f"id-card-{suffix}",
+        "full_name": "ID Card Applicant",
+        "email": f"id-card-{suffix}@example.test",
+        "password": "VaultTraceTest!123",
+        "password_confirmation": "VaultTraceTest!123",
+        "account_type": "viewer",
+        "organization_name": "",
+        "institution_id": institution_id,
+        "employee_id": None,
+        "department": "",
+        "designation": "",
+        "consent": True,
+    }
+    image = Image.new("RGB", (32, 20), color="navy")
+    image_bytes = io.BytesIO()
+    png_info = PngInfo()
+    png_info.add_text("private-note", "should not be retained")
+    image.save(image_bytes, format="PNG", pnginfo=png_info)
+    response = client.post(
+        "/api/auth/register-with-evidence",
+        data={"registration_data": json.dumps(payload)},
+        files={"identity_card": ("card.png", image_bytes.getvalue(), "image/png")},
+    )
+    assert response.status_code == 201
+
+    with SessionLocal() as db:
+        registration = db.scalar(select(main.RegistrationRequest).where(
+            main.RegistrationRequest.public_id == response.json()["registration_id"]
+        ))
+        assert registration is not None
+        registration_db_id = registration.id
+        stored_path = tmp_path / registration.identity_document_stored_name
+        assert stored_path.is_file()
+        assert registration.identity_document_content_type == "image/png"
+        assert registration.identity_document_size == stored_path.stat().st_size
+        assert registration.identity_document_sha256 == main.hashlib.sha256(stored_path.read_bytes()).hexdigest()
+        viewer = User(
+            username=f"image-viewer-{suffix}",
+            password_hash=pwd_context.hash("ViewerPassword123!"),
+            role=Role.viewer,
+        )
+        viewer_name = viewer.username
+        db.add(viewer)
+        db.commit()
+
+    assert client.get(
+        f"/api/admin/registration-requests/{registration_db_id}/identity-document"
+    ).status_code == 401
+    viewer_login = client.post(
+        "/api/auth/token",
+        data={"username": viewer_name, "password": "ViewerPassword123!"},
+    )
+    assert viewer_login.status_code == 200
+    assert client.get(
+        f"/api/admin/registration-requests/{registration_db_id}/identity-document",
+        headers={"Authorization": f"Bearer {viewer_login.json()['access_token']}"},
+    ).status_code == 403
+    reviewer_response = client.get(
+        f"/api/admin/registration-requests/{registration_db_id}/identity-document",
+        headers=auth_headers(),
+    )
+    assert reviewer_response.status_code == 200
+    assert reviewer_response.headers["cache-control"] == "no-store"
+    assert reviewer_response.headers["x-content-type-options"] == "nosniff"
+    with Image.open(io.BytesIO(reviewer_response.content)) as reviewed_image:
+        assert reviewed_image.size == (32, 20)
+        assert "private-note" not in reviewed_image.info
+    queued = client.get("/api/admin/registration-requests", headers=auth_headers())
+    reviewed = next(item for item in queued.json() if item["id"] == registration_db_id)
+    assert reviewed["has_identity_document"] is True
+    assert reviewed["registration_id"] == response.json()["registration_id"]
+    assert reviewed["username"] == payload["username"]
+    assert reviewed["full_name"] == payload["full_name"]
+    assert reviewed["email"] == payload["email"]
+    assert reviewed["account_type"] == payload["account_type"]
+    assert reviewed["identity_document_content_type"] == "image/png"
+    assert reviewed["identity_document_size"] > 0
+    assert reviewed["email_verified_at"] is None
+    assert reviewed["institution_name"] == institution_name
+    with SessionLocal() as db:
+        actions = set(db.scalars(select(RegistrationAuditEvent.action).where(
+            RegistrationAuditEvent.registration_id == registration_db_id
+        )).all())
+        assert {"identity_document_uploaded", "identity_document_viewed"} <= actions
+
+
+def test_registration_id_card_rejects_non_image_files(monkeypatch):
+    monkeypatch.setattr(main, "send_account_email", lambda recipient, subject, body: True)
+    suffix = uuid.uuid4().hex[:10]
+    payload = {
+        "username": f"bad-card-{suffix}",
+        "full_name": "Invalid Image Applicant",
+        "email": f"bad-card-{suffix}@example.test",
+        "password": "VaultTraceTest!123",
+        "password_confirmation": "VaultTraceTest!123",
+        "account_type": "viewer",
+        "consent": True,
+    }
+    response = client.post(
+        "/api/auth/register-with-evidence",
+        data={"registration_data": json.dumps(payload)},
+        files={"identity_card": ("card.png", b"not an image", "image/png")},
+    )
+    assert response.status_code == 400
+
+
+def test_employee_id_is_unique_and_role_waits_for_employee_review(monkeypatch):
+    registered, token, payload = register_request(monkeypatch, account_type="reviewing_officer")
+    assert registered.status_code == 201
+    assert token
+    duplicate, _, _ = register_request(
+        monkeypatch,
+        account_type="reviewing_officer",
+        employee_id=payload["employee_id"],
+    )
+    assert duplicate.status_code == 409
+    assert verify_email(token).status_code == 200
+
+    with SessionLocal() as db:
+        request = db.scalar(select(main.RegistrationRequest).where(main.RegistrationRequest.public_id == registered.json()["registration_id"]))
+        request_id = request.id
+    headers = auth_headers()
+    assert decide_registration(headers, request_id, "verify_identity").status_code == 200
+    blocked = decide_registration(headers, request_id, "approve_role")
+    assert blocked.status_code == 409
+    employee = decide_registration(headers, request_id, "verify_employee", "Matched authorized employee directory record.")
+    assert employee.status_code == 200
+    assert decide_registration(headers, request_id, "approve_role").status_code == 200
+
+    with SessionLocal() as db:
+        verification = db.scalar(select(EmployeeVerification).where(EmployeeVerification.registration_id == request_id))
+        assert verification.status == "approved"
+        assert verification.method == "authorized_manual_review"
+        assert verification.reviewer_id is not None
+        assert verification.reviewed_at is not None
+        assert verification.decision_reason
+
+
+def test_institution_association_is_approved_before_membership(monkeypatch):
+    headers = auth_headers()
+    suffix = uuid.uuid4().hex[:8]
+    institution_response = client.post(
+        "/api/institutions",
+        headers=headers,
+        json={"name": f"Registration Institution {suffix}", "code": f"REG-{suffix}"},
+    )
+    assert institution_response.status_code == 200
+    institution_id = institution_response.json()["id"]
+    registered, token, payload = register_request(
+        monkeypatch,
+        account_type="institution_user",
+        institution_id=institution_id,
+    )
+    assert registered.status_code == 201
+    assert token
+    assert verify_email(token).status_code == 200
+
+    with SessionLocal() as db:
+        request = db.scalar(select(main.RegistrationRequest).where(main.RegistrationRequest.public_id == registered.json()["registration_id"]))
+        request_id = request.id
+    assert decide_registration(headers, request_id, "verify_identity").status_code == 200
+    assert decide_registration(headers, request_id, "verify_institution").status_code == 200
+    assert decide_registration(headers, request_id, "approve_role").status_code == 200
+
+    login = client.post("/api/auth/token", data={"username": payload["username"], "password": payload["password"]})
+    assert login.status_code == 200
+    user_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    institution_list = client.get("/api/institutions", headers=user_headers, params={"q": suffix})
+    assert [item["id"] for item in institution_list.json()] == [institution_id]
+
+
+def test_github_oauth_unavailable_state_and_callback_replay(monkeypatch):
+    registered, _, _ = register_request(monkeypatch)
+    registration_id = registered.json()["registration_id"]
+    monkeypatch.setattr(settings, "github_client_id", None)
+    monkeypatch.setattr(settings, "github_client_secret", None)
+    monkeypatch.setattr(settings, "github_callback_url", None)
+    unavailable = client.get("/api/auth/github/start", params={"registration_id": registration_id})
+    assert unavailable.status_code == 503
+
+    monkeypatch.setattr(settings, "github_client_id", "test-client")
+    monkeypatch.setattr(settings, "github_client_secret", "test-secret")
+    monkeypatch.setattr(settings, "github_callback_url", "http://localhost/callback")
+    start = client.get("/api/auth/github/start", params={"registration_id": registration_id})
+    assert start.status_code == 200
+    state = parse_qs(urlparse(start.json()["authorization_url"]).query)["state"][0]
+    callback = client.get(
+        "/api/auth/github/callback",
+        params={"state": state, "error": "access_denied"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert "github=denied" in callback.headers["location"]
+    replay = client.get(
+        "/api/auth/github/callback",
+        params={"state": state, "error": "access_denied"},
+        follow_redirects=False,
+    )
+    assert replay.status_code == 400
+
+
+def test_password_reset_token_expiry_is_enforced():
+    token = f"expired-{uuid.uuid4().hex}"
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.username == "admin"))
+        db.add(AuthTokenRecord(
+            user_id=user.id,
+            token_hash=token_digest(token),
+            purpose="password_reset",
+            expires_at=datetime.now(timezone.utc).replace(microsecond=0),
+        ))
+        db.commit()
+    expired = client.post(
+        "/api/auth/password-reset/confirm",
+        json={"token": token, "password": "NewVaultTracePassword123!"},
+    )
+    assert expired.status_code == 400
+
+
+def test_configured_bootstrap_requires_token(monkeypatch):
+    monkeypatch.setattr(settings, "bootstrap_token", "render-bootstrap-secret")
+    monkeypatch.setattr(settings, "initial_admin_password", "A-strong-password-123")
+    response = client.post("/api/auth/bootstrap")
+    assert response.status_code == 403
 
 
 def auth_headers():
@@ -695,3 +1098,159 @@ def test_incomplete_extraction_can_be_submitted_as_intake_draft():
     listed = client.get("/api/fdr-intakes", headers=headers)
     assert listed.status_code == 200
     assert any(item["id"] == submitted.json()["id"] for item in listed.json())
+
+
+def test_discrepancy_analysis_is_scoped_and_review_actions_are_audited():
+    headers = auth_headers()
+    suffix = uuid.uuid4().hex[:8]
+    institution = client.post(
+        "/api/institutions",
+        headers=headers,
+        json={"name": f"Analysis Academy {suffix}", "code": f"ANALYSIS-{suffix}"},
+    )
+    assert institution.status_code == 200
+
+    def create_fdr(identifier: str):
+        response = client.post("/api/fdrs", headers=headers, json={
+            "identifier": identifier,
+            "institution_id": institution.json()["id"],
+            "holder_name": "Stored Holder",
+            "approval_case_reference": f"CASE-{suffix}",
+            "bank_name": "Example Bank",
+            "branch_name": "Main Branch",
+            "ifsc_code": "SBIN0001234",
+            "amount": 100000,
+            "amount_in_words": "Rupees One Lakh Only",
+            "issue_date": "2026-01-01T00:00:00Z",
+            "maturity_date": "2027-01-01T00:00:00Z",
+            "beneficiary": "VaultTrace Authority",
+            "joint_holder": "Stored Holder",
+            "lien_endorsed": False,
+        })
+        assert response.status_code == 200
+        return response.json()
+
+    first = create_fdr(f"FDR-ANALYSIS-{suffix}")
+    second = create_fdr(f"FDR-ISOLATED-{suffix}")
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.insert_text(
+        (72, 72),
+        f"FDR number: FDR-OCR-DIFFERENT-{suffix}\nHolder Name: OCR Holder\nAmount: 250000",
+    )
+    content = pdf.tobytes()
+    pdf.close()
+    uploaded = client.post(
+        f"/api/fdrs/{first['id']}/documents",
+        headers=headers,
+        files={"file": (f"analysis-{suffix}.pdf", io.BytesIO(content), "application/pdf")},
+    )
+    assert uploaded.status_code == 200
+    extraction = client.post(f"/api/documents/{uploaded.json()['id']}/extract", headers=headers)
+    assert extraction.status_code == 200
+
+    analysis = client.post(f"/api/fdrs/{first['id']}/discrepancies/analyze", headers=headers)
+    assert analysis.status_code == 200
+    payload = analysis.json()
+    assert payload["analysis_method"] == "rule_based"
+    amount_finding = next(item for item in payload["findings"] if item["rule_id"].startswith("AUTO:OCR_MISMATCH:amount"))
+    assert amount_finding["fdr_id"] == first["id"]
+    assert amount_finding["expected_value"] == "100000.0"
+    assert amount_finding["observed_value"] == "250000"
+    assert "OCR" in amount_finding["observed_source"]
+    assert f"Document #{uploaded.json()['id']}" in amount_finding["evidence_reference"]
+    assert amount_finding["evidence_document_ids"] == [uploaded.json()["id"]]
+    repeated = client.post(f"/api/fdrs/{first['id']}/discrepancies/analyze", headers=headers)
+    assert repeated.status_code == 200
+    assert {item["rule_id"] for item in repeated.json()["findings"]} == {
+        item["rule_id"] for item in payload["findings"]
+    }
+
+    chat = client.post(
+        f"/api/fdrs/{first['id']}/discrepancies/chat",
+        headers=headers,
+        json={"question": "Does the amount match?"},
+    )
+    assert chat.status_code == 200
+    assert chat.json()["analysis_method"] == "rule_based"
+    assert chat.json()["fdr_id"] == first["id"]
+    assert "100,000.00" in chat.json()["reply"]
+    assert "250000" in chat.json()["reply"]
+    assert f"Finding #{amount_finding['id']}" in chat.json()["reply"]
+    assert any("document #" in source.casefold() for source in chat.json()["sources"])
+
+    invalid_chat = client.post(
+        f"/api/fdrs/{first['id']}/discrepancies/chat",
+        headers=headers,
+        json={"question": "x"},
+    )
+    assert invalid_chat.status_code == 422
+
+    isolated = client.post(f"/api/fdrs/{second['id']}/discrepancies/analyze", headers=headers)
+    assert isolated.status_code == 200
+    assert all(item["fdr_id"] == second["id"] for item in isolated.json()["findings"])
+    assert not any(item["rule_id"].startswith("AUTO:OCR_MISMATCH") for item in isolated.json()["findings"])
+    unavailable_comparison = client.post(
+        f"/api/fdrs/{second['id']}/discrepancies/chat",
+        headers=headers,
+        json={"question": "Does the amount match?"},
+    )
+    assert unavailable_comparison.status_code == 200
+    assert "does not confirm the field was checked" in unavailable_comparison.json()["reply"]
+
+    reviewed = client.post(
+        f"/api/discrepancies/{amount_finding['id']}/review",
+        headers=headers,
+        json={"action": "mark_reviewed", "reason": "Compared against the attached receipt."},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["review_status"] == "reviewed"
+    assert reviewed.json()["history"][-1]["action"] == "mark_reviewed"
+
+    dismissed = client.post(
+        f"/api/discrepancies/{amount_finding['id']}/review",
+        headers=headers,
+        json={"action": "dismiss", "reason": "The OCR amount was misread; the source is consistent."},
+    )
+    assert dismissed.status_code == 200
+    assert dismissed.json()["review_status"] == "dismissed"
+    assert dismissed.json()["status"] == "resolved"
+    assert len(dismissed.json()["history"]) == 2
+
+    reopened = client.post(
+        f"/api/discrepancies/{amount_finding['id']}/review",
+        headers=headers,
+        json={"action": "confirm", "reason": "A second reviewer confirmed the amount mismatch."},
+    )
+    assert reopened.status_code == 200
+    assert reopened.json()["review_status"] == "confirmed"
+    assert reopened.json()["status"] == "open"
+
+    missing = client.post("/api/fdrs/2147483647/discrepancies/analyze", headers=headers)
+    assert missing.status_code == 404
+
+    reviewer_name = f"analysis-reviewer-{suffix}"
+    with SessionLocal() as db:
+        db.add(User(
+            username=reviewer_name,
+            password_hash=pwd_context.hash("ReviewPass123!"),
+            role=Role.reviewer,
+        ))
+        db.commit()
+    reviewer_token = client.post(
+        "/api/auth/token",
+        data={"username": reviewer_name, "password": "ReviewPass123!"},
+    )
+    reviewer_headers = {"Authorization": f"Bearer {reviewer_token.json()['access_token']}"}
+    denied = client.post(
+        f"/api/discrepancies/{amount_finding['id']}/review",
+        headers=reviewer_headers,
+        json={"action": "confirm", "reason": "No institution access."},
+    )
+    assert denied.status_code == 403
+    denied_chat = client.post(
+        f"/api/fdrs/{first['id']}/discrepancies/chat",
+        headers=reviewer_headers,
+        json={"question": "Summarize findings"},
+    )
+    assert denied_chat.status_code == 403
