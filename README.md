@@ -172,7 +172,14 @@ To deploy:
    real bank confirmations.
    The six role-linked demo institutions also receive three varied synthetic
    programme offerings each, so institution-scoped demo roles have catalogue
-   data to explore.
+   data to explore. Role dashboard samples reuse the 438 seeded instrument
+   records and show distinct synthetic workloads: 12 institution-user
+   FDRs (3 drafts, 7 verified and 2 returned for correction), 60 pending, 259
+   verified and 28 failed verification cases, 28 open and 17 resolved review
+   cases, 214 custody instruments with 12 pending handovers and 8 release
+   requests, 18 active demo validation rules across 8 document categories, and
+   542 audit events across 23 institutions with 6 synthetic audit findings.
+   These role counts describe demo samples and are not real operational records.
 
 For production, do not use the free plan. Upgrade the API and Postgres to paid
 plans, attach persistent upload storage or use private object storage, configure

@@ -6,14 +6,18 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+import json
 import uuid
 
 from PIL import Image, ImageDraw
-from sqlalchemy import Column, MetaData, String, Table, insert, select
+from sqlalchemy import Column, MetaData, String, Table, func, insert, select
 
 from .main import (
     AuditEvent,
+    CustodyEvent,
     DepositAssessment,
+    Discrepancy,
+    DiscrepancyStatus,
     EmployeeVerification,
     FieldProvenance,
     Fdr,
@@ -25,6 +29,7 @@ from .main import (
     PolicyRule,
     ProvenanceLevel,
     ReleaseRequest,
+    ReleaseType,
     RegistrationAuditEvent,
     RegistrationRequest,
     Role,
@@ -757,6 +762,277 @@ def _seed_demo_programmes(db) -> None:
             existing.add(offering_key)
 
 
+def _seed_role_dashboard_metrics() -> None:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        PUBLIC_DEMO_STATE.create(bind=db.get_bind(), checkfirst=True)
+        state_key = "role_dashboard_samples_v1"
+        if db.execute(
+            select(PUBLIC_DEMO_STATE.c.value).where(PUBLIC_DEMO_STATE.c.key == state_key)
+        ).scalar_one_or_none() is not None:
+            return
+
+        roles = {
+            username: db.scalar(select(User).where(User.username == username))
+            for username in (
+                "demo_administrator",
+                "demo_auditor",
+                "demo_institution_user",
+                "demo_reviewing_officer",
+                "demo_verification_officer",
+                "demo_custody_officer",
+            )
+        }
+        audit_institutions = db.scalars(
+            select(Institution).order_by(Institution.id).limit(23)
+        ).all()
+        if any(user is None for user in roles.values()) or len(audit_institutions) != 23:
+            raise RuntimeError("Demo roles and 23 institutions must exist before role dashboard samples.")
+
+        reviewer = roles["demo_reviewing_officer"]
+        verifier = roles["demo_verification_officer"]
+        custodian = roles["demo_custody_officer"]
+        auditor = roles["demo_auditor"]
+        role_institution = db.scalar(
+            select(Institution).where(Institution.code == "PUBLIC-DEMO-001")
+        )
+        fdrs = db.scalars(select(Fdr).order_by(Fdr.identifier)).all()
+        volume_fdrs = [fdr for fdr in fdrs if fdr.identifier.startswith("DEMO-VOLUME-")]
+        if len(volume_fdrs) < 347:
+            raise RuntimeError("Dashboard volume FDRs must be seeded before role dashboard samples.")
+
+        institution_rows = db.scalars(
+            select(Fdr)
+            .where(Fdr.institution_id == role_institution.id)
+            .order_by(Fdr.identifier)
+        ).all()
+        institution_fdrs = [
+            fdr for fdr in institution_rows
+            if fdr.identifier.startswith(("DEMO-FDR-", "DEMO-INSTITUTION-DRAFT-", "DEMO-VOLUME-"))
+        ]
+        institution_status_targets = {
+            FdrStatus.draft: 3,
+            FdrStatus.verified: 7,
+            FdrStatus.under_review: 2,
+        }
+        institution_status_counts = {status: 0 for status in institution_status_targets}
+        institution_samples: list[Fdr] = []
+        for fdr in institution_fdrs[:12]:
+            if fdr.status in institution_status_targets and institution_status_counts[fdr.status] < institution_status_targets[fdr.status]:
+                institution_samples.append(fdr)
+                institution_status_counts[fdr.status] += 1
+                continue
+            needed_status = next(
+                status for status, target in institution_status_targets.items()
+                if institution_status_counts[status] < target
+            )
+            previous = fdr.status
+            fdr.status = needed_status
+            db.add(LifecycleEvent(
+                fdr_id=fdr.id,
+                from_status=previous.value,
+                to_status=needed_status.value,
+                reason="Synthetic role dashboard sample status.",
+                actor_id=roles["demo_administrator"].id,
+            ))
+            institution_samples.append(fdr)
+            institution_status_counts[needed_status] += 1
+        for status, target in institution_status_targets.items():
+            missing = target - institution_status_counts[status]
+            donors = [
+                fdr for fdr in volume_fdrs
+                if fdr not in institution_samples
+                and fdr.institution_id != role_institution.id
+                and fdr.status == status
+            ][:missing]
+            if len(donors) != missing:
+                raise RuntimeError(f"Not enough synthetic {status.value} FDRs for institution role samples.")
+            for fdr in donors:
+                fdr.institution_id = role_institution.id
+                fdr.holder_name = role_institution.name
+                institution_samples.append(fdr)
+        if len(institution_samples) != 12:
+            raise RuntimeError("The institution role dashboard sample did not reach 12 FDRs.")
+        for fdr in institution_samples:
+            db.add(AuditEvent(
+                actor_id=roles["demo_institution_user"].id,
+                action="demo_role_institution_sample",
+                entity="fdr",
+                entity_id=fdr.identifier,
+                details="Synthetic institution-user dashboard sample.",
+            ))
+        returned_samples = [
+            fdr for fdr in institution_samples
+            if fdr.status == FdrStatus.under_review
+        ]
+        for index, fdr in enumerate(returned_samples, start=1):
+            rule_id = f"DEMO-ROLE-INSTITUTION-RETURN-{index:02d}"
+            if not db.scalar(select(Discrepancy.id).where(Discrepancy.rule_id == rule_id)):
+                db.add(Discrepancy(
+                    fdr_id=fdr.id,
+                    rule_id=rule_id,
+                    severity="medium",
+                    explanation="Synthetic sample returned for correction; update the declared record before resubmission.",
+                    expected_value="Complete and consistent declaration",
+                    observed_value="Correction requested",
+                    status=DiscrepancyStatus.open,
+                ))
+
+        verification_statuses = (
+            [VerificationStatus.verified] * 259
+            + [VerificationStatus.pending] * 60
+            + [VerificationStatus.rejected] * 28
+        )
+        selected_verification_ids = {fdr.id for fdr in volume_fdrs[:347]}
+        for fdr, status in zip(volume_fdrs[:347], verification_statuses):
+            case = db.scalar(select(VerificationCase).where(VerificationCase.fdr_id == fdr.id))
+            if case is None:
+                case = VerificationCase(fdr_id=fdr.id)
+                db.add(case)
+            case.status = status
+            case.assigned_to = verifier.id
+            case.outcome_notes = "Synthetic verification-role dashboard sample; no real bank confirmation."
+            case.evidence_reference = f"DEMO-ROLE-VERIFICATION-{fdr.identifier.rsplit('-', 1)[-1]}"
+        for case in db.scalars(
+            select(VerificationCase).where(VerificationCase.assigned_to == verifier.id)
+        ):
+            if case.fdr_id not in selected_verification_ids:
+                case.assigned_to = None
+
+        reviewer_institution = db.scalar(
+            select(Institution).where(Institution.code == "PUBLIC-DEMO-002")
+        )
+        reviewer_fdrs = db.scalars(
+            select(Fdr)
+            .where(Fdr.institution_id == reviewer_institution.id)
+            .order_by(Fdr.identifier)
+        ).all()
+        if not reviewer_fdrs:
+            raise RuntimeError("The reviewer sample institution must have at least one FDR.")
+        for index in range(1, 46):
+            finding_id = (
+                f"DEMO-ROLE-REVIEW-AUDIT-{index:02d}"
+                if index <= 6
+                else f"DEMO-ROLE-REVIEW-{index:02d}"
+            )
+            if db.scalar(select(Discrepancy.id).where(Discrepancy.rule_id == finding_id)):
+                continue
+            resolved = index > 28
+            db.add(Discrepancy(
+                fdr_id=reviewer_fdrs[(index - 1) % len(reviewer_fdrs)].id,
+                rule_id=finding_id,
+                severity="high" if index % 4 == 0 else "medium",
+                explanation=(
+                    "Synthetic auditor sample finding for review dashboard."
+                    if index <= 6
+                    else "Synthetic reviewer workflow sample; not a real institutional finding."
+                ),
+                expected_value="Declared value matches supporting evidence",
+                observed_value=f"Synthetic discrepancy sample {index:02d}",
+                status=DiscrepancyStatus.resolved if resolved else DiscrepancyStatus.open,
+                resolution_notes="Synthetic sample marked resolved." if resolved else "",
+                resolved_by=reviewer.id if resolved else None,
+            ))
+
+        for fdr in volume_fdrs[:214]:
+            evidence_reference = f"DEMO-ROLE-CUSTODY-{fdr.id}"
+            if not db.scalar(
+                select(CustodyEvent.id).where(
+                    CustodyEvent.actor_id == custodian.id,
+                    CustodyEvent.evidence_reference == evidence_reference,
+                )
+            ):
+                db.add(CustodyEvent(
+                    fdr_id=fdr.id,
+                    event_type="received",
+                    location=f"Demo Vault / Cabinet {(fdr.id % 12) + 1:02d}",
+                    custodian="Synthetic Demo Custody Officer",
+                    evidence_reference=evidence_reference,
+                    remarks="Synthetic custody dashboard sample; no physical instrument is represented.",
+                    actor_id=custodian.id,
+                ))
+        for fdr in volume_fdrs[:12]:
+            evidence_reference = f"DEMO-ROLE-HANDOVER-{fdr.id}"
+            if not db.scalar(
+                select(CustodyEvent.id).where(
+                    CustodyEvent.actor_id == custodian.id,
+                    CustodyEvent.evidence_reference == evidence_reference,
+                )
+            ):
+                db.add(CustodyEvent(
+                    fdr_id=fdr.id,
+                    event_type="handover_pending",
+                    location=f"Demo Vault / Handover Desk {(fdr.id % 4) + 1}",
+                    custodian="Synthetic Demo Custody Officer",
+                    evidence_reference=evidence_reference,
+                    remarks="Synthetic pending handover sample.",
+                    actor_id=custodian.id,
+                ))
+        for index, fdr in enumerate(volume_fdrs[:8], start=1):
+            reason = f"DEMO-ROLE-CUSTODY-RELEASE-{index:02d}: Synthetic release request sample."
+            if not db.scalar(select(ReleaseRequest.id).where(ReleaseRequest.reason == reason)):
+                db.add(ReleaseRequest(
+                    fdr_id=fdr.id,
+                    request_type=ReleaseType.release,
+                    reason=reason,
+                    status="pending",
+                    requested_by=custodian.id,
+                ))
+
+        document_categories = (
+            "Security Deposit FDR",
+            "Institution Registration",
+            "Bank Confirmation",
+            "Lien Endorsement",
+            "Board Resolution",
+            "Renewal Evidence",
+            "Release Clearance",
+            "Identity Proof",
+        )
+        policy_creator = roles["demo_administrator"]
+        for index in range(18):
+            rule_id = f"DEMO-ROLE-POLICY-{index + 1:02d}"
+            if db.scalar(select(PolicyRule.id).where(PolicyRule.rule_id == rule_id)):
+                continue
+            required_documents = [
+                document_categories[index % len(document_categories)],
+                document_categories[(index + 1) % len(document_categories)],
+            ]
+            db.add(PolicyRule(
+                rule_id=rule_id,
+                description=f"Synthetic active validation rule {index + 1:02d} for role dashboard samples.",
+                required_documents=json.dumps(required_documents),
+                amount_floor=100_000 + index * 25_000,
+                effective_date=now - timedelta(days=30),
+                expiry_date=now + timedelta(days=365),
+                version=1,
+                active=True,
+                source_reference="Synthetic public demo policy; not regulatory guidance.",
+                created_by=policy_creator.id,
+            ))
+
+        existing_audit_count = db.scalar(
+            select(func.count(AuditEvent.id)).where(AuditEvent.action == "demo_audit_review")
+        ) or 0
+        for index in range(existing_audit_count, 542):
+            institution = audit_institutions[index % len(audit_institutions)]
+            db.add(AuditEvent(
+                actor_id=auditor.id,
+                action="demo_audit_review",
+                entity="institution",
+                entity_id=str(institution.id),
+                details=(
+                    f"DEMO-ROLE-DASHBOARD-AUDIT-{index + 1:03d}: Synthetic audit trail sample."
+                ),
+                created_at=now - timedelta(minutes=index),
+            ))
+
+        db.execute(
+            insert(PUBLIC_DEMO_STATE).values(key=state_key, value="true")
+        )
+        db.commit()
+
+
 def seed_public_demo() -> None:
     _seed_demo_directory_and_accounts()
 
@@ -768,6 +1044,7 @@ def seed_public_demo() -> None:
     _seed_role_examples()
     _seed_registration_samples()
     _seed_dashboard_volume()
+    _seed_role_dashboard_metrics()
     with SessionLocal() as db:
         if db.execute(
             select(PUBLIC_DEMO_STATE.c.key).where(PUBLIC_DEMO_STATE.c.key == "initialized")

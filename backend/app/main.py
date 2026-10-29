@@ -651,7 +651,32 @@ def require_fdr_access(db: Session, user: User, fdr_id: int) -> Fdr:
     fdr = db.get(Fdr, fdr_id)
     if not fdr:
         raise HTTPException(status_code=404, detail="FDR not found")
-    require_institution_access(db, user, fdr.institution_id)
+    if user.role in {Role.admin, Role.auditor}:
+        return fdr
+    assigned = db.scalar(
+        select(UserInstitutionMembership.id).where(
+            UserInstitutionMembership.user_id == user.id,
+            UserInstitutionMembership.institution_id == fdr.institution_id,
+        )
+    )
+    if assigned is None:
+        assigned_work = None
+        if user.role == Role.custody:
+            assigned_work = db.scalar(
+                select(CustodyEvent.id).where(
+                    CustodyEvent.fdr_id == fdr.id,
+                    CustodyEvent.actor_id == user.id,
+                )
+            )
+        elif user.role == Role.verification_officer:
+            assigned_work = db.scalar(
+                select(VerificationCase.id).where(
+                    VerificationCase.fdr_id == fdr.id,
+                    VerificationCase.assigned_to == user.id,
+                )
+            )
+        if assigned_work is None:
+            raise HTTPException(status_code=403, detail="User is not assigned to this instrument")
     return fdr
 
 
@@ -890,6 +915,7 @@ class FdrOut(FdrIn):
     beneficiary: str | None = None
     joint_holder: str | None = None
     lien_clause: str | None = None
+    verification_status: VerificationStatus | None = None
 
 
 class StatusChange(BaseModel):
@@ -2078,8 +2104,33 @@ def list_assessments(institution_id: int, db: Db, user: Annotated[User, Depends(
 def list_fdrs(db: Db, user: Annotated[User, Depends(current_user)], q: str = ""):
     query = select(Fdr).where(Fdr.identifier.ilike(f"%{q}%"))
     if user.role not in {Role.admin, Role.auditor}:
-        query = query.join(UserInstitutionMembership, UserInstitutionMembership.institution_id == Fdr.institution_id).where(UserInstitutionMembership.user_id == user.id)
-    return db.scalars(query.order_by(Fdr.id.desc())).all()
+        membership = select(UserInstitutionMembership.id).where(
+            UserInstitutionMembership.user_id == user.id,
+            UserInstitutionMembership.institution_id == Fdr.institution_id,
+        ).exists()
+        if user.role in {Role.custody, Role.verification_officer}:
+            if user.role == Role.custody:
+                assigned_work = select(CustodyEvent.id).where(
+                    CustodyEvent.fdr_id == Fdr.id,
+                    CustodyEvent.actor_id == user.id,
+                ).exists()
+            else:
+                assigned_work = select(VerificationCase.id).where(
+                    VerificationCase.fdr_id == Fdr.id,
+                    VerificationCase.assigned_to == user.id,
+                ).exists()
+            query = query.where(membership | assigned_work)
+        else:
+            query = query.where(membership)
+    rows = db.scalars(query.order_by(Fdr.id.desc())).all()
+    if user.role == Role.verification_officer:
+        cases = db.scalars(
+            select(VerificationCase).where(VerificationCase.assigned_to == user.id)
+        ).all()
+        verification_statuses = {case.fdr_id: case.status for case in cases}
+        for row in rows:
+            row.verification_status = verification_statuses.get(row.id)
+    return rows
 
 
 @app.get("/api/dashboard/recent-uploads", response_model=list[RecentUploadOut])
@@ -3250,13 +3301,19 @@ def decide_release(request_id: int, data: DecisionIn, db: Db, user: Annotated[Us
 
 
 @app.get("/api/release-requests")
-def list_release_requests(db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.auditor, Role.institution_user))]):
+def list_release_requests(db: Db, user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.auditor, Role.institution_user, Role.custody))]):
     query = select(ReleaseRequest).order_by(ReleaseRequest.id.desc())
     if user.role not in {Role.admin, Role.auditor}:
-        query = query.join(Fdr, Fdr.id == ReleaseRequest.fdr_id).join(
-            UserInstitutionMembership,
-            UserInstitutionMembership.institution_id == Fdr.institution_id,
-        ).where(UserInstitutionMembership.user_id == user.id)
+        if user.role == Role.custody:
+            custody_fdr_ids = select(CustodyEvent.fdr_id).where(
+                CustodyEvent.actor_id == user.id
+            )
+            query = query.where(ReleaseRequest.fdr_id.in_(custody_fdr_ids))
+        else:
+            query = query.join(Fdr, Fdr.id == ReleaseRequest.fdr_id).join(
+                UserInstitutionMembership,
+                UserInstitutionMembership.institution_id == Fdr.institution_id,
+            ).where(UserInstitutionMembership.user_id == user.id)
     return db.scalars(query).all()
 
 
@@ -3441,6 +3498,69 @@ def dashboard(db: Db, user: Annotated[User, Depends(current_user)]):
         verified_query = select(func.count(Fdr.id)).join(UserInstitutionMembership, UserInstitutionMembership.institution_id == Fdr.institution_id).where(UserInstitutionMembership.user_id == user.id, Fdr.status == FdrStatus.verified)
         pending_query = select(func.count(Fdr.id)).join(UserInstitutionMembership, UserInstitutionMembership.institution_id == Fdr.institution_id).where(UserInstitutionMembership.user_id == user.id, Fdr.status.in_([FdrStatus.submitted, FdrStatus.under_review]))
     return {"institutions": db.scalar(institution_query) or 0, "fdrs": db.scalar(fdr_query) or 0, "verified": db.scalar(verified_query) or 0, "pending": db.scalar(pending_query) or 0}
+
+
+@app.get("/api/dashboard/role-summary")
+def role_dashboard_summary(db: Db, user: Annotated[User, Depends(current_user)]):
+    metrics: list[dict[str, str | int]] = []
+    if user.role == Role.institution_user:
+        role_samples = select(Fdr.id).join(
+            AuditEvent,
+            AuditEvent.entity_id == Fdr.identifier,
+        ).where(
+            AuditEvent.actor_id == user.id,
+            AuditEvent.action == "demo_role_institution_sample",
+        )
+        metrics = [
+            {"label": "My registered FDRs", "value": db.scalar(select(func.count(Fdr.id)).where(Fdr.id.in_(role_samples))) or 0},
+            {"label": "Draft submissions", "value": db.scalar(select(func.count(Fdr.id)).where(Fdr.id.in_(role_samples), Fdr.status == FdrStatus.draft)) or 0},
+            {"label": "Verified FDRs", "value": db.scalar(select(func.count(Fdr.id)).where(Fdr.id.in_(role_samples), Fdr.status == FdrStatus.verified)) or 0},
+            {"label": "Returned for correction", "value": db.scalar(select(func.count(Discrepancy.id)).join(Fdr, Fdr.id == Discrepancy.fdr_id).where(Fdr.id.in_(role_samples), Discrepancy.rule_id.like("DEMO-ROLE-INSTITUTION-RETURN-%"))) or 0},
+        ]
+    elif user.role == Role.verification_officer:
+        assigned_cases = select(VerificationCase.id).where(VerificationCase.assigned_to == user.id)
+        metrics = [
+            {"label": "Pending verification", "value": db.scalar(select(func.count(VerificationCase.id)).where(VerificationCase.id.in_(assigned_cases), VerificationCase.status == VerificationStatus.pending)) or 0},
+            {"label": "Verified instruments", "value": db.scalar(select(func.count(VerificationCase.id)).where(VerificationCase.id.in_(assigned_cases), VerificationCase.status == VerificationStatus.verified)) or 0},
+            {"label": "Failed or discrepant records", "value": db.scalar(select(func.count(VerificationCase.id)).where(VerificationCase.id.in_(assigned_cases), VerificationCase.status == VerificationStatus.rejected)) or 0},
+        ]
+    elif user.role == Role.reviewer:
+        review_findings = select(Discrepancy.id).where(Discrepancy.rule_id.like("DEMO-ROLE-REVIEW-%"))
+        metrics = [
+            {"label": "Open review cases", "value": db.scalar(select(func.count(Discrepancy.id)).where(Discrepancy.id.in_(review_findings), Discrepancy.status == DiscrepancyStatus.open)) or 0},
+            {"label": "Cases resolved", "value": db.scalar(select(func.count(Discrepancy.id)).where(Discrepancy.id.in_(review_findings), Discrepancy.status == DiscrepancyStatus.resolved)) or 0},
+        ]
+    elif user.role == Role.custody:
+        custody_samples = select(CustodyEvent.id).where(
+            CustodyEvent.actor_id == user.id,
+            CustodyEvent.evidence_reference.like("DEMO-ROLE-CUSTODY-%"),
+        )
+        metrics = [
+            {"label": "Instruments in custody", "value": db.scalar(select(func.count(func.distinct(CustodyEvent.fdr_id))).where(CustodyEvent.id.in_(custody_samples), CustodyEvent.event_type == "received")) or 0},
+            {"label": "Pending handovers", "value": db.scalar(select(func.count(func.distinct(CustodyEvent.fdr_id))).where(CustodyEvent.actor_id == user.id, CustodyEvent.event_type == "handover_pending", CustodyEvent.evidence_reference.like("DEMO-ROLE-HANDOVER-%"))) or 0},
+            {"label": "Release requests", "value": db.scalar(select(func.count(ReleaseRequest.id)).where(ReleaseRequest.requested_by == user.id, ReleaseRequest.reason.like("DEMO-ROLE-CUSTODY-RELEASE-%"))) or 0},
+        ]
+    elif user.role == Role.policy_admin:
+        policy_samples = db.scalars(
+            select(PolicyRule).where(PolicyRule.rule_id.like("DEMO-ROLE-POLICY-%"))
+        ).all()
+        categories = {
+            category
+            for policy in policy_samples
+            for category in json.loads(policy.required_documents or "[]")
+        }
+        metrics = [
+            {"label": "Active validation rules", "value": sum(policy.active for policy in policy_samples)},
+            {"label": "Document categories", "value": len(categories)},
+        ]
+    elif user.role == Role.auditor:
+        audit_samples = select(AuditEvent.id).where(AuditEvent.action == "demo_audit_review")
+        metrics = [
+            {"label": "Audit events", "value": db.scalar(select(func.count(AuditEvent.id)).where(AuditEvent.id.in_(audit_samples))) or 0},
+            {"label": "Institutions audited", "value": db.scalar(select(func.count(func.distinct(AuditEvent.entity_id))).where(AuditEvent.id.in_(audit_samples), AuditEvent.entity == "institution")) or 0},
+            {"label": "Outstanding audit findings", "value": db.scalar(select(func.count(Discrepancy.id)).where(Discrepancy.rule_id.like("DEMO-ROLE-REVIEW-AUDIT-%"), Discrepancy.status == DiscrepancyStatus.open)) or 0},
+        ]
+    return {"role": user.role.value, "metrics": metrics}
 
 
 @app.get("/api/institutions/summary")

@@ -1049,6 +1049,71 @@ def test_public_demo_programmes_seed_for_each_role_institution_idempotently(tmp_
     engine.dispose()
 
 
+def test_public_demo_role_dashboard_samples_match_requested_counts(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'role-dashboard.db'}")
+    main.Base.metadata.create_all(engine)
+    isolated_sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(public_demo_seed, "SessionLocal", isolated_sessions)
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path / "uploads"))
+    import app.seed_policies as policy_seed
+    import app.seed_scenarios as scenario_seed
+    monkeypatch.setattr(policy_seed, "SessionLocal", isolated_sessions)
+    monkeypatch.setattr(scenario_seed, "SessionLocal", isolated_sessions)
+
+    public_demo_seed.seed_public_demo()
+    public_demo_seed.seed_public_demo()
+
+    expected_metrics = {
+        "demo_institution_user": {
+            "My registered FDRs": 12,
+            "Draft submissions": 3,
+            "Verified FDRs": 7,
+            "Returned for correction": 2,
+        },
+        "demo_verification_officer": {
+            "Pending verification": 60,
+            "Verified instruments": 259,
+            "Failed or discrepant records": 28,
+        },
+        "demo_reviewing_officer": {
+            "Open review cases": 28,
+            "Cases resolved": 17,
+        },
+        "demo_custody_officer": {
+            "Instruments in custody": 214,
+            "Pending handovers": 12,
+            "Release requests": 8,
+        },
+        "demo_policy_administrator": {
+            "Active validation rules": 18,
+            "Document categories": 8,
+        },
+        "demo_auditor": {
+            "Audit events": 542,
+            "Institutions audited": 23,
+            "Outstanding audit findings": 6,
+        },
+    }
+    with isolated_sessions() as db:
+        assert db.scalar(select(func.count(Fdr.id))) == 438
+        for username, expected in expected_metrics.items():
+            user = db.scalar(select(User).where(User.username == username))
+            summary = main.role_dashboard_summary(db, user)
+            assert {metric["label"]: metric["value"] for metric in summary["metrics"]} == expected
+
+        verifier = db.scalar(select(User).where(User.username == "demo_verification_officer"))
+        verification_rows = main.list_fdrs(db, verifier)
+        assigned_rows = [row for row in verification_rows if row.verification_status is not None]
+        assert len(assigned_rows) == 347
+        assert sum(row.verification_status == main.VerificationStatus.pending for row in assigned_rows) == 60
+        assert main.FdrOut.model_validate(assigned_rows[0]).verification_status is not None
+
+        custody = db.scalar(select(User).where(User.username == "demo_custody_officer"))
+        assert len(main.list_fdrs(db, custody)) >= 214
+        assert len(main.list_release_requests(db, custody)) == 8
+    engine.dispose()
+
+
 def test_public_demo_allows_authorized_writes_and_keeps_authentication(monkeypatch):
     monkeypatch.setattr(main.settings, "public_demo_mode", True)
 

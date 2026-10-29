@@ -12,6 +12,7 @@ const API = configuredApiUrl
 const publicDemoMode = import.meta.env.VITE_PUBLIC_DEMO === "true";
 
 type Summary = { institutions: number; fdrs: number; verified: number; pending: number };
+type RoleDashboardSummary = { role: string; metrics: Array<{ label: string; value: number }> };
 type User = { id: number; username: string; role: string };
 const demoPassword = "VaultTrace-Demo-2026!";
 type Institution = { id: number; name: string; code: string; address: string; aicte_id?: string; other_id?: string; district: string; state: string; institution_type: string; women: string; minority: string; university: string };
@@ -20,7 +21,7 @@ type RegistrationStatus = { registration_id: string; account_type: string; statu
 type RegistrationReview = { id: number; registration_id: string; username: string; full_name: string; email: string; account_type: string; organization_name: string; institution_id: number | null; institution_name: string | null; employee_id: string | null; department: string; designation: string; status: string; email_verified_at: string | null; identity_status: string; employee_status: string; institution_status: string; role_status: string; created_at: string; decision_reason: string; decision_at: string | null; has_identity_document: boolean; identity_document_content_type: string | null; identity_document_size: number | null };
 type Programme = { id: number; programme: string; level: string; course: string; course_type: string; shift: string; availability: string; intake: string; enrollment: string; placement: string };
 type InstitutionSummary = { institutions: number; programmes: number; states: string[]; institution_types: string[] };
-type Fdr = { id: number; identifier: string; institution_id: number; holder_name: string; amount: number; maturity_date: string; status: string; approval_case_reference?: string; bank_name?: string; branch_name?: string; ifsc_code?: string; amount_in_words?: string; issue_date?: string; beneficiary?: string; joint_holder?: string; lien_endorsed?: boolean; lien_clause?: string };
+type Fdr = { id: number; identifier: string; institution_id: number; holder_name: string; amount: number; maturity_date: string; status: string; verification_status?: string | null; approval_case_reference?: string; bank_name?: string; branch_name?: string; ifsc_code?: string; amount_in_words?: string; issue_date?: string; beneficiary?: string; joint_holder?: string; lien_endorsed?: boolean; lien_clause?: string };
 type Policy = { id: number; rule_id: string; description: string; amount_floor: number; version: number; active: boolean; source_reference: string; effective_date: string; expiry_date?: string };
 type DiscrepancyHistory = { id: number; actor_id: number; action: string; reason: string; created_at: string };
 type Discrepancy = { id: number; fdr_id: number; rule_id: string; title?: string; affected_field?: string; severity: string; explanation: string; expected_value: string; expected_source?: string; observed_value: string; observed_source?: string; evidence_reference?: string; evidence_document_ids?: number[]; recommended_action?: string; analysis_method?: string; status: string; review_status?: string; resolution_notes: string; history?: DiscrepancyHistory[] };
@@ -926,7 +927,7 @@ function PageContent({ page, setPage, setError, role, selectedInstrument, select
     case "institutions": return <Institutions setError={setError} role={role} />;
     case "registry": return <Registry setPage={setPage} setError={setError} role={role} openInstrument={openInstrument} />;
     case "instrument-detail": return selectedInstrument ? <InstrumentDetail id={selectedInstrument} setPage={setPage} setError={setError} role={role} /> : <Registry setPage={setPage} setError={setError} role={role} openInstrument={openInstrument} />;
-    case "verification": return <Verification setPage={setPage} setError={setError} openDiscrepancy={openDiscrepancy} />;
+    case "verification": return <Verification setPage={setPage} setError={setError} openDiscrepancy={openDiscrepancy} role={role} />;
     case "documents": return <Documents setError={setError} setPage={setPage} />;
     case "discrepancies": return <Discrepancies setError={setError} initialFdrId={selectedDiscrepancyFdrId} onSelectFdr={selectDiscrepancyInstrument} role={role} />;
     case "release": return <Release setError={setError} role={role} />;
@@ -936,7 +937,7 @@ function PageContent({ page, setPage, setError, role, selectedInstrument, select
     case "audit": return <Audit setError={setError} />;
     case "policies": return <Policies setError={setError} role={role} />;
     case "accounts": return <AccountApprovals role={role} setError={setError} />;
-    default: return <Overview setPage={setPage} setError={setError} openInstrument={openInstrument} />;
+    default: return <Overview setPage={setPage} setError={setError} openInstrument={openInstrument} role={role} />;
   }
 }
 
@@ -1143,12 +1144,14 @@ function AccountApprovals({ role, setError }: { role: string; setError: (message
   </>;
 }
 
-function Overview({ setPage, setError, openInstrument }: { setPage: (p: Page) => void; setError: (s: string) => void; openInstrument: (id: number) => void }) {
+function Overview({ setPage, setError, openInstrument, role }: { setPage: (p: Page) => void; setError: (s: string) => void; openInstrument: (id: number) => void; role: string }) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [fdrs, setFdrs] = useState<Fdr[]>([]);
   const [directory, setDirectory] = useState<InstitutionSummary | null>(null);
   const [recentUploads, setRecentUploads] = useState<RecentUpload[]>([]);
-  useEffect(() => { Promise.all([request<Summary>("/api/dashboard/summary"), request<Fdr[]>("/api/fdrs"), request<InstitutionSummary>("/api/institutions/summary"), request<RecentUpload[]>("/api/dashboard/recent-uploads")]).then(([s, f, d, uploads]) => { setSummary(s); setFdrs(f); setDirectory(d); setRecentUploads(uploads); }).catch((e) => setError(e.message)); }, [setError]);
+  const [roleSummary, setRoleSummary] = useState<RoleDashboardSummary | null>(null);
+  useEffect(() => { Promise.all([request<Summary>("/api/dashboard/summary"), request<Fdr[]>("/api/fdrs"), request<InstitutionSummary>("/api/institutions/summary"), request<RecentUpload[]>("/api/dashboard/recent-uploads"), request<RoleDashboardSummary>("/api/dashboard/role-summary")]).then(([s, f, d, uploads, roleMetrics]) => { setSummary(s); setFdrs(f); setDirectory(d); setRecentUploads(uploads); setRoleSummary(roleMetrics); }).catch((e) => setError(e.message)); }, [setError]);
+  const greetingRole = ({ admin: "administrator", institution_user: "institution user", verification_officer: "verification officer", reviewer: "reviewer", custody: "custody officer", policy_admin: "policy administrator", auditor: "auditor", officer: "officer", viewer: "viewer" } as Record<string, string>)[role] || "user";
   const statuses = useMemo(() => fdrs.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] || 0) + 1; return acc; }, {}), [fdrs]);
   const chartStatuses = registryStatusOrder
     .filter((status) => statuses[status])
@@ -1158,7 +1161,7 @@ function Overview({ setPage, setError, openInstrument }: { setPage: (p: Page) =>
   return <>
     <PageHeader
       eyebrow="OPERATIONS / OVERVIEW"
-      title="Good morning, administrator"
+      title={`Good morning, ${greetingRole}`}
       description="Here’s the current pulse of your deposit registry."
       action={<button className="button primary" onClick={() => setPage("registry")}><Icon name="plus" size={16} />Register an FDR</button>}
     />
@@ -1170,6 +1173,17 @@ function Overview({ setPage, setError, openInstrument }: { setPage: (p: Page) =>
         </div>
       ))}
     </section>
+    {!!roleSummary?.metrics.length && <section className="panel table-panel">
+      <div className="panel-heading"><div><h2>Role dashboard metrics</h2><p>Synthetic workflow samples for this demo role</p></div></div>
+      <div className="metric-grid">
+        {roleSummary.metrics.map((metric, index) => (
+          <div className="metric-card" key={metric.label}>
+            <div className={`metric-icon ${["blue", "teal", "amber", "neutral"][index % 4]}`}><Icon name={index % 2 ? "shield" : "file"} /></div>
+            <div><span>{metric.label}</span><strong>{metric.value}</strong><small>Demo sample records</small></div>
+          </div>
+        ))}
+      </div>
+    </section>}
     <section className="panel table-panel">
       <div className="panel-heading">
         <div><h2>Institution catalogue coverage</h2><p>AICTE directory data available for operational scenarios</p></div>
@@ -1329,10 +1343,12 @@ function InstrumentDetail({ id, setPage, setError, role }: { id: number; setPage
   </div>;
 }
 
-function Verification({ setPage, setError, openDiscrepancy }: { setPage: (p: Page) => void; setError: (s: string) => void; openDiscrepancy: (id: number) => void }) {
+function Verification({ setPage, setError, openDiscrepancy, role }: { setPage: (p: Page) => void; setError: (s: string) => void; openDiscrepancy: (id: number) => void; role: string }) {
   const [rows, setRows] = useState<Fdr[]>([]); useEffect(() => { request<Fdr[]>("/api/fdrs").then(setRows).catch((e) => setError(e.message)); }, [setError]);
-  const queue = rows.filter((row) => ["submitted", "under_review"].includes(row.status));
-  return <><PageHeader eyebrow="OPERATIONS / VERIFICATION" title="Verification centre" description="Review evidence, record outcomes and keep authenticity decisions separate from OCR." action={<button className="button secondary" onClick={() => setPage("documents")}><Icon name="paperclip" size={16} />Review documents</button>} /><div className="info-banner"><Icon name="shield" size={18} /><div><b>Evidence-led verification</b><span>OCR and document hashes support review but do not prove authenticity or bank confirmation.</span></div></div><section className="panel table-panel"><TableHeader title="Cases awaiting review" subtitle={`${queue.length} cases in your queue`} /><table><thead><tr><th>Instrument</th><th>Holder</th><th>Amount</th><th>Due date</th><th>Status</th><th /></tr></thead><tbody>{queue.length ? queue.map((row) => <tr key={row.id}><td><b>{row.identifier}</b><small className="table-sub">FDR-{String(row.id).padStart(5, "0")}</small></td><td>{row.holder_name}</td><td>{formatAmount(row.amount)}</td><td>{new Date(row.maturity_date).toLocaleDateString("en-IN")}</td><td><StatusBadge value={row.status} /></td><td className="align-right"><button className="row-action" onClick={() => openDiscrepancy(row.id)}>Open case <Icon name="arrow" size={14} /></button></td></tr>) : <tr><td colSpan={6}><EmptyState text="Your verification queue is clear." /></td></tr>}</tbody></table></section></>;
+  const queue = rows.filter((row) => role === "verification_officer"
+    ? ["pending", "in_review", "clarification"].includes(row.verification_status || "")
+    : ["submitted", "under_review"].includes(row.status));
+  return <><PageHeader eyebrow="OPERATIONS / VERIFICATION" title="Verification centre" description="Review evidence, record outcomes and keep authenticity decisions separate from OCR." action={<button className="button secondary" onClick={() => setPage("documents")}><Icon name="paperclip" size={16} />Review documents</button>} /><div className="info-banner"><Icon name="shield" size={18} /><div><b>Evidence-led verification</b><span>OCR and document hashes support review but do not prove authenticity or bank confirmation.</span></div></div><section className="panel table-panel"><TableHeader title="Cases awaiting review" subtitle={`${queue.length} cases in your queue`} /><table><thead><tr><th>Instrument</th><th>Holder</th><th>Amount</th><th>Due date</th><th>Status</th><th /></tr></thead><tbody>{queue.length ? queue.map((row) => <tr key={row.id}><td><b>{row.identifier}</b><small className="table-sub">FDR-{String(row.id).padStart(5, "0")}</small></td><td>{row.holder_name}</td><td>{formatAmount(row.amount)}</td><td>{new Date(row.maturity_date).toLocaleDateString("en-IN")}</td><td><StatusBadge value={role === "verification_officer" ? row.verification_status || row.status : row.status} /></td><td className="align-right"><button className="row-action" onClick={() => openDiscrepancy(row.id)}>Open case <Icon name="arrow" size={14} /></button></td></tr>) : <tr><td colSpan={6}><EmptyState text="Your verification queue is clear." /></td></tr>}</tbody></table></section></>;
 }
 
 function Documents({ setError, setPage }: { setError: (s: string) => void; setPage: (page: Page) => void }) {
