@@ -170,6 +170,9 @@ To deploy:
    438 synthetic FDR records: 348 verified-status examples, 36 under review,
    13 submitted and 41 drafts. All statuses are synthetic workflow data, not
    real bank confirmations.
+   The six role-linked demo institutions also receive three varied synthetic
+   programme offerings each, so institution-scoped demo roles have catalogue
+   data to explore.
 
 For production, do not use the free plan. Upgrade the API and Postgres to paid
 plans, attach persistent upload storage or use private object storage, configure

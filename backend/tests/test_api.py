@@ -1025,6 +1025,30 @@ def test_public_demo_dashboard_volume_seeds_requested_counts_idempotently(monkey
     engine.dispose()
 
 
+def test_public_demo_programmes_seed_for_each_role_institution_idempotently(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'demo-programmes.db'}")
+    main.Base.metadata.create_all(engine)
+    isolated_sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with isolated_sessions() as db:
+        for index in range(1, 7):
+            db.add(Institution(
+                name=f"Demo Institution {index}",
+                code=f"PUBLIC-DEMO-{index:03d}",
+            ))
+        db.flush()
+        public_demo_seed._seed_demo_programmes(db)
+        db.commit()
+        public_demo_seed._seed_demo_programmes(db)
+        db.commit()
+
+        assert db.scalar(select(func.count(main.InstitutionProgramme.id))) == 18
+        for institution in db.scalars(select(Institution)).all():
+            assert db.scalar(select(func.count(main.InstitutionProgramme.id)).where(
+                main.InstitutionProgramme.institution_id == institution.id
+            )) == 3
+    engine.dispose()
+
+
 def test_public_demo_allows_authorized_writes_and_keeps_authentication(monkeypatch):
     monkeypatch.setattr(main.settings, "public_demo_mode", True)
 

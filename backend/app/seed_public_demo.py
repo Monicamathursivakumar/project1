@@ -20,6 +20,7 @@ from .main import (
     FdrStatus,
     InstrumentVersion,
     Institution,
+    InstitutionProgramme,
     LifecycleEvent,
     PolicyRule,
     ProvenanceLevel,
@@ -83,6 +84,38 @@ DEMO_STATUS_TARGETS = {
     FdrStatus.under_review: 36,
     FdrStatus.submitted: 13,
     FdrStatus.draft: 41,
+}
+DEMO_PROGRAMME_OFFERINGS = {
+    "PUBLIC-DEMO-001": (
+        ("Engineering", "Undergraduate", "Computer Science and Engineering", "Full-time", "Morning", "Available", "120", "108", "82%"),
+        ("Engineering", "Undergraduate", "Electrical Engineering", "Full-time", "Morning", "Available", "90", "76", "78%"),
+        ("Engineering", "Postgraduate", "Structural Engineering", "Full-time", "Evening", "Available", "36", "29", "86%"),
+    ),
+    "PUBLIC-DEMO-002": (
+        ("Diploma", "Diploma", "Mechanical Engineering", "Full-time", "Morning", "Available", "60", "54", "74%"),
+        ("Diploma", "Diploma", "Computer Engineering", "Full-time", "Afternoon", "Available", "60", "51", "81%"),
+        ("Diploma", "Diploma", "Civil Engineering", "Part-time", "Evening", "Limited", "40", "32", "69%"),
+    ),
+    "PUBLIC-DEMO-003": (
+        ("Science", "Undergraduate", "Data Science", "Full-time", "Morning", "Available", "80", "72", "77%"),
+        ("Computer Applications", "Undergraduate", "Bachelor of Computer Applications", "Full-time", "Morning", "Available", "100", "91", "79%"),
+        ("Computer Applications", "Postgraduate", "Master of Computer Applications", "Full-time", "Evening", "Available", "50", "43", "84%"),
+    ),
+    "PUBLIC-DEMO-004": (
+        ("Technology", "Undergraduate", "Artificial Intelligence", "Full-time", "Morning", "Available", "90", "84", "88%"),
+        ("Technology", "Undergraduate", "Information Systems", "Full-time", "Afternoon", "Available", "75", "66", "80%"),
+        ("Technology", "Postgraduate", "Cybersecurity", "Part-time", "Evening", "Limited", "40", "34", "91%"),
+    ),
+    "PUBLIC-DEMO-005": (
+        ("Design", "Undergraduate", "Communication Design", "Full-time", "Morning", "Available", "60", "56", "83%"),
+        ("Design", "Undergraduate", "Product Design", "Full-time", "Afternoon", "Available", "45", "39", "79%"),
+        ("Design", "Postgraduate", "User Experience Design", "Part-time", "Evening", "Limited", "30", "26", "87%"),
+    ),
+    "PUBLIC-DEMO-006": (
+        ("Management", "Undergraduate", "Business Administration", "Full-time", "Morning", "Available", "120", "112", "76%"),
+        ("Commerce", "Undergraduate", "Commerce", "Full-time", "Afternoon", "Available", "100", "88", "72%"),
+        ("Management", "Postgraduate", "Business Administration", "Full-time", "Evening", "Available", "60", "55", "89%"),
+    ),
 }
 
 
@@ -565,6 +598,8 @@ def _seed_role_examples() -> None:
         if not all((admin, institution_user, verification_officer, institution, verification_institution, policy_institution)):
             raise RuntimeError("Public demo accounts and institutions must be seeded before role examples.")
 
+        _seed_demo_programmes(db)
+
         if not db.scalar(select(Fdr.id).where(Fdr.identifier == INSTITUTION_DRAFT)):
             fdr = Fdr(
                 identifier=INSTITUTION_DRAFT,
@@ -681,6 +716,45 @@ def _seed_role_examples() -> None:
                 created_by=admin.id,
             ))
         db.commit()
+
+
+def _seed_demo_programmes(db) -> None:
+    institutions = {
+        institution.code: institution
+        for institution in db.scalars(
+            select(Institution).where(Institution.code.in_(DEMO_PROGRAMME_OFFERINGS))
+        )
+    }
+    if len(institutions) != len(DEMO_PROGRAMME_OFFERINGS):
+        raise RuntimeError("All role-linked public demo institutions must exist before programme seeding.")
+
+    existing = set(db.execute(
+        select(
+            InstitutionProgramme.institution_id,
+            InstitutionProgramme.programme,
+            InstitutionProgramme.level,
+            InstitutionProgramme.course,
+        )
+    ).all())
+    for code, offerings in DEMO_PROGRAMME_OFFERINGS.items():
+        institution = institutions[code]
+        for programme, level, course, course_type, shift, availability, intake, enrollment, placement in offerings:
+            offering_key = (institution.id, programme, level, course)
+            if offering_key in existing:
+                continue
+            db.add(InstitutionProgramme(
+                institution_id=institution.id,
+                programme=programme,
+                level=level,
+                course=course,
+                course_type=course_type,
+                shift=shift,
+                availability=availability,
+                intake=intake,
+                enrollment=enrollment,
+                placement=placement,
+            ))
+            existing.add(offering_key)
 
 
 def seed_public_demo() -> None:
