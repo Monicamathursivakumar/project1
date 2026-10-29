@@ -2,7 +2,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0011_registration_identity_documents"
+revision = "0011_registration_docs"
 down_revision = "0010_registration_identity"
 
 
