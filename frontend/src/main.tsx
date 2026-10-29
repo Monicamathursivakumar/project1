@@ -618,13 +618,13 @@ function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => v
           <label htmlFor="login-username">Username<input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" required={!import.meta.env.DEV && !publicDemo} /></label>
           <label htmlFor="login-password">Password<input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required={!import.meta.env.DEV && !publicDemo} /></label>
           <button className="button primary wide" disabled={loading}>{loading ? "Opening workspace…" : "Sign in securely"}<Icon name="arrow" size={17} /></button>
-          {!publicDemo && <><div className="auth-links"><button type="button" onClick={() => switchMode("register")}>Create Account</button><button type="button" onClick={() => switchMode("forgot")}>Forgot Password?</button></div>
-            <button className="auth-text-button" type="button" onClick={() => switchMode("status")}>Check registration status / resend verification</button>
-            <button className="auth-text-button" type="button" onClick={() => { setError(""); setNotice("Contact your VaultTrace system administrator through your organization’s support channel."); }}>Contact Administrator</button></>}
+          <div className="auth-links"><button type="button" onClick={() => switchMode("register")}>Create Account</button><button type="button" onClick={() => switchMode("forgot")}>Forgot Password?</button></div>
+          <button className="auth-text-button" type="button" onClick={() => switchMode("status")}>Check registration status / resend verification</button>
+          <button className="auth-text-button" type="button" onClick={() => { setError(""); setNotice("Contact your VaultTrace system administrator through your organization’s support channel."); }}>Contact Administrator</button>
         </form>
         {(import.meta.env.DEV || publicDemo) && <section className="demo-login" aria-labelledby="demo-login-title">
           <div className="demo-login-heading">
-            <span className="demo-environment"><i /> {publicDemo ? "Shared writable demo" : "Local demo"}</span>
+            <span className="demo-environment"><i /> {publicDemo ? "Demo access" : "Local demo"}</span>
             <h3 id="demo-login-title">Explore by role</h3>
             <p>Choose a demo account to sign in and compare the role-specific workspace.</p>
           </div>
@@ -635,7 +635,7 @@ function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => v
               <span className="demo-role-action">{loading ? "Opening…" : "Sign in"}<Icon name="arrow" size={14} /></span>
             </button>)}
           </div>
-          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>.</p>
+          <p className="demo-password-note">Demo password <code>{demoPassword}</code>.</p>
         </section>}
       </>}
       {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => {
