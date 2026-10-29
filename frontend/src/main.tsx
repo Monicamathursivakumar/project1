@@ -1346,7 +1346,84 @@ function Documents({ setError, setPage }: { setError: (s: string) => void; setPa
         : workflowStage === "register"
           ? "Preparing FDR draft…"
           : "Processing complete.";
-  return <><PageHeader eyebrow="MAIN WORKFLOW / INTAKE" title="Upload & Analyze FDR" description="Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft." /><div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div><section className="analyze-layout"><div className="panel analyze-card"><div className="eyebrow">AUTO OCR</div><h2>Upload your FDR document</h2><p>Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository.</p><label className="analyze-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><input type="file" accept=".pdf,.png,.jpg,.jpeg" onChange={(e) => chooseFile(e.target.files?.[0] || null)} /><Icon name="upload" size={28} /><b>{file ? file.name : "Drag and drop your FDR document here, or"}</b><button type="button" className="button primary">Choose FDR document</button><small>Supported formats: JPG, JPEG, PNG, PDF · Max size: 10 MB</small></label><label className="select-label">Attach to existing FDR record (optional)<select value={selected} onChange={(e) => setSelected(e.target.value)}><option value="">Use first available record</option>{fdrs.map((row) => <option value={row.id} key={row.id}>{row.identifier} · {row.holder_name}</option>)}</select></label><button className="button primary wide" disabled={processing} onClick={analyze}><Icon name="upload" size={16} />{processing ? "Uploading and processing…" : "Analyze document"}</button>{workflowStage && <div className="analysis-progress" role="status" aria-live="polite" aria-busy={processing}><div className="analysis-progress-heading">{processing && <span className="analysis-progress-spinner" aria-hidden="true" />}<div><b>{workflowStatus}</b><small>OCR results are suggestions and do not verify authenticity.</small></div></div><ol className="analysis-progress-steps">{workflowSteps.map((step, index) => { const complete = index < currentWorkflowStep; const current = index === currentWorkflowStep && workflowStage !== "complete"; return <li key={step.key} className={complete ? "is-complete" : current ? "is-current" : ""} aria-current={current ? "step" : undefined}><span className="analysis-progress-number">{complete ? <Icon name="check" size={13} /> : index + 1}</span><div><b>{step.label}</b><small>{step.detail}</small></div></li>; })}</ol></div>}{message && <div className="success-message"><Icon name={processing ? "clock" : "check"} size={15} />{message}</div>}</div><div className="panel analyze-guidance"><div className="eyebrow">CONVERSION FLOW</div><h2>Manual document → FDR repository</h2><div className="conversion-steps"><div><i>1</i><span><b>Upload</b><small>Store the original and SHA-256 fingerprint</small></span></div><div><i>2</i><span><b>Extract</b><small>Run PyMuPDF or Tesseract OCR</small></span></div><div><i>3</i><span><b>Review</b><small>Check candidate fields against the document</small></span></div><div><i>4</i><span><b>Register</b><small>Submit a draft into the FDR master records</small></span></div></div><button className="button secondary wide" onClick={() => setPage("registry")}>Open FDR master records <Icon name="arrow" size={16} /></button></div></section>{extracted && <section className="panel extraction-review"><div><div className="eyebrow">EXTRACTION RESULT</div><h2>Review candidate data before registration</h2><p>{extracted.provider} · {extracted.page_count} page(s) · {extracted.text.length} characters · authenticity unconfirmed</p></div><div className="extracted-text">{extracted.text || "No text was detected. Use the original document and enter values manually."}</div><div className="form-actions"><button className="button ghost" onClick={() => { setExtracted(null); setWorkflowStage(null); }}>Discard result</button><button className="button primary" disabled={processing} onClick={convertToDraft}>{processing ? "Converting…" : "Convert to FDR master-record draft"} <Icon name="arrow" size={16} /></button></div></section>}{showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => { setShowRegistration(false); setWorkflowStage("review"); }} onSaved={(result) => { setShowRegistration(false); setWorkflowStage("complete"); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}</>;
+  return <>
+    <PageHeader
+      eyebrow="MAIN WORKFLOW / INTAKE"
+      title="Upload & Analyze FDR"
+      description={publicDemoMode
+        ? "Browse synthetic FDR records. Document uploads are disabled in this public read-only demo."
+        : "Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft."}
+    />
+    {publicDemoMode
+      ? <div className="info-banner"><Icon name="shield" size={18} /><div><b>Uploads are disabled</b><span>Document uploads and OCR processing are unavailable in the shared demo. Browse the synthetic FDR records instead.</span></div></div>
+      : <div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div>}
+    <section className="analyze-layout">
+      <div className="panel analyze-card">
+        <div className="eyebrow">{publicDemoMode ? "READ-ONLY DEMO" : "AUTO OCR"}</div>
+        <h2>{publicDemoMode ? "Document analysis unavailable" : "Upload your FDR document"}</h2>
+        <p>{publicDemoMode
+          ? "This public showcase uses synthetic records only. File selection, upload, extraction, and draft creation are turned off."
+          : "Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository."}</p>
+        {!publicDemoMode && <>
+          <label className="analyze-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
+            <input type="file" accept=".pdf,.png,.jpg,.jpeg" onChange={(e) => chooseFile(e.target.files?.[0] || null)} />
+            <Icon name="upload" size={28} />
+            <b>{file ? file.name : "Drag and drop your FDR document here, or"}</b>
+            <button type="button" className="button primary">Choose FDR document</button>
+            <small>Supported formats: JPG, JPEG, PNG, PDF · Max size: 10 MB</small>
+          </label>
+          <label className="select-label">Attach to existing FDR record (optional)
+            <select value={selected} onChange={(e) => setSelected(e.target.value)}>
+              <option value="">Use first available record</option>
+              {fdrs.map((row) => <option value={row.id} key={row.id}>{row.identifier} · {row.holder_name}</option>)}
+            </select>
+          </label>
+          <button className="button primary wide" disabled={processing} onClick={analyze}>
+            <Icon name="upload" size={16} />{processing ? "Uploading and processing…" : "Analyze document"}
+          </button>
+          {workflowStage && <div className="analysis-progress" role="status" aria-live="polite" aria-busy={processing}>
+            <div className="analysis-progress-heading">
+              {processing && <span className="analysis-progress-spinner" aria-hidden="true" />}
+              <div><b>{workflowStatus}</b><small>OCR results are suggestions and do not verify authenticity.</small></div>
+            </div>
+            <ol className="analysis-progress-steps">
+              {workflowSteps.map((step, index) => {
+                const complete = index < currentWorkflowStep;
+                const current = index === currentWorkflowStep && workflowStage !== "complete";
+                return <li key={step.key} className={complete ? "is-complete" : current ? "is-current" : ""} aria-current={current ? "step" : undefined}>
+                  <span className="analysis-progress-number">{complete ? <Icon name="check" size={13} /> : index + 1}</span>
+                  <div><b>{step.label}</b><small>{step.detail}</small></div>
+                </li>;
+              })}
+            </ol>
+          </div>}
+          {message && <div className="success-message"><Icon name={processing ? "clock" : "check"} size={15} />{message}</div>}
+        </>}
+      </div>
+      <div className="panel analyze-guidance">
+        <div className="eyebrow">{publicDemoMode ? "DEMO DATA" : "CONVERSION FLOW"}</div>
+        <h2>{publicDemoMode ? "Explore synthetic FDR records" : "Manual document → FDR repository"}</h2>
+        {publicDemoMode
+          ? <p>Review the sample instruments in the registry. Changes, uploads, and OCR processing are unavailable in this shared read-only environment.</p>
+          : <div className="conversion-steps">
+            <div><i>1</i><span><b>Upload</b><small>Store the original and SHA-256 fingerprint</small></span></div>
+            <div><i>2</i><span><b>Extract</b><small>Run PyMuPDF or Tesseract OCR</small></span></div>
+            <div><i>3</i><span><b>Review</b><small>Check candidate fields against the document</small></span></div>
+            <div><i>4</i><span><b>Register</b><small>Submit a draft into the FDR master records</small></span></div>
+          </div>}
+        <button className="button secondary wide" onClick={() => setPage("registry")}>Open FDR master records <Icon name="arrow" size={16} /></button>
+      </div>
+    </section>
+    {!publicDemoMode && extracted && <section className="panel extraction-review">
+      <div><div className="eyebrow">EXTRACTION RESULT</div><h2>Review candidate data before registration</h2><p>{extracted.provider} · {extracted.page_count} page(s) · {extracted.text.length} characters · authenticity unconfirmed</p></div>
+      <div className="extracted-text">{extracted.text || "No text was detected. Use the original document and enter values manually."}</div>
+      <div className="form-actions">
+        <button className="button ghost" onClick={() => { setExtracted(null); setWorkflowStage(null); }}>Discard result</button>
+        <button className="button primary" disabled={processing} onClick={convertToDraft}>{processing ? "Converting…" : "Convert to FDR master-record draft"} <Icon name="arrow" size={16} /></button>
+      </div>
+    </section>}
+    {!publicDemoMode && showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => { setShowRegistration(false); setWorkflowStage("review"); }} onSaved={(result) => { setShowRegistration(false); setWorkflowStage("complete"); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}
+  </>;
 }
 
 function Discrepancies({ setError, initialFdrId, onSelectFdr, role }: { setError: (s: string) => void; initialFdrId: number | null; onSelectFdr: (id: number | null) => void; role: string }) {
