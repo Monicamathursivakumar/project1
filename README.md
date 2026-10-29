@@ -166,6 +166,10 @@ To deploy:
 4. Open the frontend service URL and sign in using one of the role cards and the
    displayed shared demo password. Sample records are seeded automatically on
    the first API startup and repaired idempotently after restarts.
+   The admin dashboard seeds at least 3,000 synthetic institutions, 438
+   synthetic FDR records, eight records with a demo verified status, and two
+   records needing attention; these are sample workflow statuses, not real bank
+   confirmations.
 
 For production, do not use the free plan. Upgrade the API and Postgres to paid
 plans, attach persistent upload storage or use private object storage, configure

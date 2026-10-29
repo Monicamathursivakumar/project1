@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 from sqlalchemy import Column, MetaData, String, Table, insert, select
 
 from .main import (
+    AuditEvent,
     DepositAssessment,
     EmployeeVerification,
     FieldProvenance,
@@ -29,6 +30,7 @@ from .main import (
     settings,
     User,
     UserInstitutionMembership,
+    FdrStatus,
     VerificationCase,
     VerificationStatus,
     pwd_context,
@@ -74,6 +76,10 @@ ROLE_INSTITUTIONS = {
 
 INSTITUTION_DRAFT = "DEMO-INSTITUTION-DRAFT-001"
 VERIFIED_CASE = "DEMO-VERIFICATION-COMPLETE-001"
+DEMO_INSTITUTION_TARGET = 3000
+DEMO_FDR_TARGET = 438
+DEMO_VERIFIED_TARGET = 8
+DEMO_ATTENTION_TARGET = 2
 
 
 def _synthetic_identity_image() -> bytes:
@@ -255,6 +261,144 @@ def _seed_registration_samples() -> None:
         db.commit()
 
 
+def _seed_dashboard_volume() -> None:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).where(User.username == "demo_administrator"))
+        if admin is None:
+            raise RuntimeError("The public demo administrator must exist before dashboard data is seeded.")
+
+        institution_count = db.query(Institution).count()
+        missing_institutions = max(0, DEMO_INSTITUTION_TARGET - institution_count)
+        institutions = db.scalars(select(Institution).order_by(Institution.id)).all()
+        institutions_by_code = {item.code for item in institutions}
+        next_institution_number = 1
+        while missing_institutions:
+            code = f"PUBLIC-DEMO-VOLUME-{next_institution_number:04d}"
+            next_institution_number += 1
+            if code in institutions_by_code:
+                continue
+            institution = Institution(
+                name=f"Synthetic Demo Institution {next_institution_number - 1:04d}",
+                code=code,
+                address="Synthetic sample record for public demo dashboard volume.",
+                district="Synthetic Demo District",
+                state="Synthetic Demo Region",
+                institution_type="Synthetic Demo Institution",
+            )
+            db.add(institution)
+            institutions.append(institution)
+            institutions_by_code.add(code)
+            missing_institutions -= 1
+        db.flush()
+
+        fdr_count = db.query(Fdr).count()
+        verified_count = db.query(Fdr).filter(Fdr.status == FdrStatus.verified).count()
+        attention_count = db.query(Fdr).filter(
+            Fdr.status.in_([FdrStatus.submitted, FdrStatus.under_review])
+        ).count()
+        verified_to_add = max(0, DEMO_VERIFIED_TARGET - verified_count)
+        attention_to_add = max(0, DEMO_ATTENTION_TARGET - attention_count)
+        missing_fdrs = max(
+            DEMO_FDR_TARGET - fdr_count,
+            verified_to_add + attention_to_add,
+            0,
+        )
+        existing_volume_ids = set(db.scalars(
+            select(Fdr.identifier).where(Fdr.identifier.like("DEMO-VOLUME-%"))
+        ).all())
+        next_fdr_number = 1
+        verification_officer = db.scalar(
+            select(User).where(User.username == "demo_verification_officer")
+        )
+        added = 0
+        verified_added = 0
+        attention_added = 0
+        while added < missing_fdrs:
+            identifier = f"DEMO-VOLUME-{next_fdr_number:04d}"
+            next_fdr_number += 1
+            if identifier in existing_volume_ids:
+                continue
+            institution = institutions[(next_fdr_number - 2) % len(institutions)]
+            if verified_added < verified_to_add:
+                status = FdrStatus.verified
+                verified_added += 1
+            elif attention_added < attention_to_add:
+                status = FdrStatus.under_review if attention_added % 2 else FdrStatus.submitted
+                attention_added += 1
+            else:
+                status = FdrStatus.draft
+            amount = 500_000 + (next_fdr_number % 20) * 50_000
+            fdr = Fdr(
+                identifier=identifier,
+                institution_id=institution.id,
+                holder_name=institution.name,
+                amount=amount,
+                approval_case_reference=f"DEMO-VOLUME-CASE-{next_fdr_number:04d}",
+                bank_name="Synthetic Demo Bank",
+                branch_name="Synthetic Demo Branch",
+                ifsc_code=f"DEMO0{next_fdr_number:06d}"[-11:],
+                amount_in_words=f"Synthetic demo amount {amount} only",
+                issue_date=now - timedelta(days=365),
+                beneficiary="Synthetic Demo Beneficiary",
+                joint_holder=institution.name,
+                lien_endorsed=True,
+                lien_clause="Synthetic demo data; not bank evidence.",
+                maturity_date=now + timedelta(days=30 + next_fdr_number % 330),
+                status=status,
+                created_by=admin.id,
+            )
+            db.add(fdr)
+            db.flush()
+            db.add(InstrumentVersion(
+                fdr_id=fdr.id,
+                version_number=1,
+                change_reason="Synthetic public demo volume sample",
+                snapshot=identifier,
+                created_by=admin.id,
+            ))
+            db.add(LifecycleEvent(
+                fdr_id=fdr.id,
+                from_status="",
+                to_status=status.value,
+                reason="Synthetic sample record for dashboard and registry demonstrations.",
+                actor_id=admin.id,
+            ))
+            db.add(FieldProvenance(
+                fdr_id=fdr.id,
+                field_name="amount",
+                value=str(amount),
+                level=ProvenanceLevel.declared,
+                evidence_reference="Synthetic public demo data; not bank evidence.",
+            ))
+            if status == FdrStatus.verified:
+                db.add(VerificationCase(
+                    fdr_id=fdr.id,
+                    status=VerificationStatus.verified,
+                    assigned_to=verification_officer.id if verification_officer else admin.id,
+                    outcome_notes="Synthetic verified-status example for dashboard demonstration; no real bank verification.",
+                    evidence_reference=f"DEMO-SYNTHETIC-{next_fdr_number:04d}",
+                ))
+            elif status in {FdrStatus.submitted, FdrStatus.under_review}:
+                db.add(VerificationCase(
+                    fdr_id=fdr.id,
+                    status=VerificationStatus.in_review if status == FdrStatus.under_review else VerificationStatus.pending,
+                    assigned_to=verification_officer.id if verification_officer else None,
+                    outcome_notes="Synthetic pending verification example for dashboard demonstration.",
+                    evidence_reference="",
+                ))
+            db.add(AuditEvent(
+                actor_id=admin.id,
+                action="scenario_seeded",
+                entity="fdr",
+                entity_id=str(fdr.id),
+                details="Synthetic public demo volume record; not a real financial instrument.",
+            ))
+            existing_volume_ids.add(identifier)
+            added += 1
+        db.commit()
+
+
 def _seed_demo_directory_and_accounts() -> None:
     codes = {f"PUBLIC-DEMO-{index:03d}" for index in range(1, len(INSTITUTIONS) + 1)}
     with SessionLocal() as db:
@@ -270,7 +414,10 @@ def _seed_demo_directory_and_accounts() -> None:
                 raise RuntimeError("Refusing to seed public demo data into a database with non-demo users.")
 
             unexpected_institutions = db.scalars(
-                select(Institution.code).where(Institution.code.not_in(codes))
+                select(Institution.code).where(
+                    Institution.code.not_in(codes),
+                    ~Institution.code.like("PUBLIC-DEMO-VOLUME-%"),
+                )
             ).all()
             if unexpected_institutions:
                 raise RuntimeError("Refusing to seed public demo data into a database with non-demo institutions.")
@@ -474,6 +621,7 @@ def seed_public_demo() -> None:
     seed_scenarios()
     _seed_role_examples()
     _seed_registration_samples()
+    _seed_dashboard_volume()
     with SessionLocal() as db:
         if db.execute(
             select(PUBLIC_DEMO_STATE.c.key).where(PUBLIC_DEMO_STATE.c.key == "initialized")

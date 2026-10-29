@@ -1,8 +1,8 @@
 from fastapi.testclient import TestClient
 import app.main as main
 import app.seed_public_demo as public_demo_seed
-from app.main import app, AuthTokenRecord, Document, EmployeeVerification, ExtractionResult, Fdr, Institution, RegistrationAuditEvent, ReleaseRequest, Role, SessionLocal, User, UserInstitutionMembership, pwd_context, select, settings, token_digest
-from sqlalchemy import create_engine
+from app.main import app, AuthTokenRecord, Document, EmployeeVerification, ExtractionResult, Fdr, FdrStatus, Institution, RegistrationAuditEvent, ReleaseRequest, Role, SessionLocal, User, UserInstitutionMembership, pwd_context, select, settings, token_digest
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timezone
 import io
@@ -971,6 +971,54 @@ def test_public_demo_registration_samples_are_synthetic_and_idempotent(monkeypat
     with Image.open(placeholder) as image:
         assert image.size == (720, 420)
         assert image.format == "PNG"
+    engine.dispose()
+
+
+def test_public_demo_dashboard_volume_seeds_requested_counts_idempotently(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'dashboard-volume.db'}")
+    main.Base.metadata.create_all(engine)
+    isolated_sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(public_demo_seed, "SessionLocal", isolated_sessions)
+    with isolated_sessions() as db:
+        admin = User(username="demo_administrator", password_hash="hash", role=Role.admin)
+        db.add(admin)
+        db.flush()
+        institution = Institution(name="Northstar Institute of Engineering", code="PUBLIC-DEMO-001")
+        db.add(institution)
+        db.flush()
+        statuses = [
+            FdrStatus.verified,
+            FdrStatus.verified,
+            FdrStatus.under_review,
+            FdrStatus.submitted,
+            FdrStatus.draft,
+            FdrStatus.draft,
+            FdrStatus.draft,
+            FdrStatus.draft,
+        ]
+        for index, status in enumerate(statuses, start=1):
+            db.add(Fdr(
+                identifier=f"DEMO-BASE-{index:03d}",
+                institution_id=institution.id,
+                holder_name=institution.name,
+                amount=100_000,
+                maturity_date=datetime(2027, 1, 1, tzinfo=timezone.utc),
+                status=status,
+                created_by=admin.id,
+            ))
+        db.commit()
+
+    public_demo_seed._seed_dashboard_volume()
+    public_demo_seed._seed_dashboard_volume()
+
+    with isolated_sessions() as db:
+        assert db.scalar(select(func.count(Institution.id))) == 3000
+        assert db.scalar(select(func.count(Fdr.id))) == 438
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.status == FdrStatus.verified)) == 8
+        assert db.scalar(select(func.count(Fdr.id)).where(
+            Fdr.status.in_([FdrStatus.submitted, FdrStatus.under_review])
+        )) == 2
+        assert db.scalar(select(func.count(Fdr.id)).where(Fdr.identifier.like("DEMO-VOLUME-%"))) == 430
     engine.dispose()
 
 
