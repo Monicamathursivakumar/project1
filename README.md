@@ -122,7 +122,7 @@ creates `demo_institution_user`, `demo_reviewing_officer`,
 not reset or duplicated. Demo staff are associated with the first institution
 in the local catalogue; institution-user records are scoped to that college.
 
-## Deploy a free read-only Render demo
+## Deploy a free shared Render demo
 
 The root `render.yaml` Blueprint defines a Vite static site, Docker-based FastAPI
 service and Render Postgres database using free plans. The frontend API URL and
@@ -130,12 +130,13 @@ browser CORS origin are linked to the deployed service URLs.
 
 When the API starts, `PUBLIC_DEMO_MODE` creates synthetic institutions,
 role-specific FDR workflows and public demo accounts in an empty demo database.
-The frontend displays role sign-in cards. All API requests that can change data
-are rejected; only sign-in and read requests are allowed. The demo credentials
-are public by design: `VaultTrace-Demo-2026!`. Do not reuse this deployment or
-password for real records or production.
+The frontend displays role sign-in cards. Authenticated users can use the
+workflows allowed by their role; institution-user operations remain scoped to
+their approved institution membership. The demo credentials are public by
+design: `VaultTrace-Demo-2026!`. Changes are shared with other visitors. Do not
+reuse this deployment or password for real records or production.
 
-This is for a temporary demo, not production:
+This is a writable temporary demo, not production:
 
 - Free web services spin down after 15 minutes without traffic and can take
   about a minute to start again.
@@ -143,10 +144,17 @@ This is for a temporary demo, not production:
   no backups. Render deletes it after the 14-day post-expiration grace period.
 - Uploads go to the API's ephemeral filesystem and are lost on service restart,
   spin-down or redeploy. Do not upload real or sensitive documents.
-- Account registration, password reset and other write workflows are disabled
-  in this read-only demo.
-- Every record is synthetic. The API refuses to seed if it finds non-demo users,
-  institutions or FDRs in the database.
+- Uploaded files may disappear while their database metadata remains, so an
+  older document can be listed but unavailable to download or reprocess.
+- Seeded records are synthetic, but visitors can create and change shared
+  records. Use synthetic data only.
+- Public account registration and password reset are not offered in the hosted
+  demo because no email-delivery provider is configured. Sign in with one of
+  the shared role accounts; normal API authentication, role checks and
+  institution scoping remain enabled.
+- The API validates the initial database before seeding, then records a durable
+  initialization marker so later starts accept shared records created through
+  the demo and continue seeding idempotently.
 
 To deploy:
 

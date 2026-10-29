@@ -19,7 +19,7 @@ from PIL import Image, ImageOps
 from email.message import EmailMessage
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
@@ -582,25 +582,6 @@ allowed_origins = [
     if (origin := value.strip().rstrip("/"))
 ]
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-
-@app.middleware("http")
-async def restrict_public_demo_writes(request: Request, call_next):
-    state_changing_get_routes = {
-        "/api/auth/github/start",
-        "/api/auth/github/callback",
-    }
-    if (
-        settings.public_demo_mode
-        and (
-            request.method not in {"GET", "HEAD", "OPTIONS"}
-            and request.url.path != "/api/auth/token"
-            or request.method in {"GET", "HEAD"}
-            and request.url.path in state_changing_get_routes
-        )
-    ):
-        return JSONResponse(status_code=403, content={"detail": "This public demo is read-only."})
-    return await call_next(request)
 
 
 def initialize_public_demo() -> None:
@@ -2155,7 +2136,7 @@ def list_fdr_intakes(db: Db, user: Annotated[User, Depends(current_user)]):
 def create_fdr_intake(
     data: FdrIntakeIn,
     db: Db,
-    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer))],
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.institution_user))],
 ):
     document = db.get(Document, data.source_document_id)
     if not document:
@@ -2265,7 +2246,7 @@ def list_documents(fdr_id: int, db: Db, user: Annotated[User, Depends(current_us
 def extract_document_text(
     document_id: int,
     db: Db,
-    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer))],
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.institution_user))],
 ):
     document = db.get(Document, document_id)
     if not document:
@@ -2451,7 +2432,7 @@ def _affidavit_candidates(text: str) -> dict[str, str]:
 def convert_document_to_fdr_draft(
     document_id: int,
     db: Db,
-    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer))],
+    user: Annotated[User, Depends(require_roles(Role.admin, Role.officer, Role.reviewer, Role.institution_user))],
     fdr_id: int | None = None,
 ):
     document = db.get(Document, document_id)

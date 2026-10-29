@@ -1,12 +1,16 @@
 from fastapi.testclient import TestClient
 import app.main as main
+import app.seed_public_demo as public_demo_seed
 from app.main import app, AuthTokenRecord, Document, EmployeeVerification, ExtractionResult, Fdr, Institution, RegistrationAuditEvent, ReleaseRequest, Role, SessionLocal, User, UserInstitutionMembership, pwd_context, select, settings, token_digest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timezone
 import io
 import json
 import re
 import uuid
 import fitz
+import pytest
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from urllib.parse import parse_qs, urlparse
@@ -847,15 +851,109 @@ def test_dashboard_recent_uploads_are_ordered_and_scoped():
     assert uploads.json()[0]["status"] == "draft"
 
 
-def test_public_demo_blocks_writes_but_allows_login_route(monkeypatch):
+def test_institution_user_can_upload_extract_convert_and_submit_intake(monkeypatch, tmp_path):
+    suffix = uuid.uuid4().hex[:8]
+    username = f"document-institution-{suffix}"
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
+    with SessionLocal() as db:
+        user = User(username=username, password_hash=pwd_context.hash("DocumentPass123!"), role=Role.institution_user)
+        institution = Institution(name=f"Document Academy {suffix}", code=f"DOC-{suffix}")
+        db.add_all([user, institution])
+        db.flush()
+        db.add(UserInstitutionMembership(user_id=user.id, institution_id=institution.id))
+        fdr = Fdr(
+            identifier=f"FDR-DOC-{suffix}",
+            institution_id=institution.id,
+            holder_name=institution.name,
+            amount=100,
+            maturity_date=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            created_by=user.id,
+        )
+        db.add(fdr)
+        db.commit()
+        fdr_id = fdr.id
+
+    token = client.post("/api/auth/token", data={"username": username, "password": "DocumentPass123!"})
+    assert token.status_code == 200
+    headers = {"Authorization": f"Bearer {token.json()['access_token']}"}
+
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.insert_text((72, 72), f"FDR number: FDR-DOC-{suffix}\nBank: Demo Bank\nAmount: 100")
+    response = client.post(
+        f"/api/fdrs/{fdr_id}/documents",
+        headers=headers,
+        files={"file": (f"synthetic-{suffix}.pdf", pdf.tobytes(), "application/pdf")},
+    )
+    pdf.close()
+    assert response.status_code == 200
+    document_id = response.json()["id"]
+
+    extraction = client.post(f"/api/documents/{document_id}/extract", headers=headers)
+    assert extraction.status_code == 200
+    assert extraction.json()["text"]
+
+    conversion = client.post(f"/api/documents/{document_id}/convert-to-fdr-draft", headers=headers)
+    assert conversion.status_code == 200
+    intake = client.post(
+        "/api/fdr-intakes",
+        headers=headers,
+        json={"source_document_id": document_id, "fields": {}},
+    )
+    assert intake.status_code == 200
+    assert intake.json()["source_fdr_id"] == fdr_id
+
+
+def test_public_demo_seeder_accepts_user_data_only_after_initialization(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'public-demo.db'}")
+    main.Base.metadata.create_all(engine)
+    isolated_sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(public_demo_seed, "SessionLocal", isolated_sessions)
+    with isolated_sessions() as db:
+        user = User(username="visitor-created-user", password_hash="hash", role=Role.viewer)
+        institution = Institution(name="Visitor Created College", code="VISITOR-COLLEGE")
+        db.add_all([user, institution])
+        db.flush()
+        db.add(Fdr(
+            identifier="VISITOR-FDR-001",
+            institution_id=institution.id,
+            holder_name=institution.name,
+            amount=100,
+            maturity_date=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            created_by=user.id,
+        ))
+        db.commit()
+
+    with pytest.raises(RuntimeError, match="non-demo users"):
+        public_demo_seed._seed_demo_directory_and_accounts()
+
+    with isolated_sessions() as db:
+        db.execute(public_demo_seed.PUBLIC_DEMO_STATE.insert().values(key="initialized", value="true"))
+        db.commit()
+
+    public_demo_seed._seed_demo_directory_and_accounts()
+
+    with isolated_sessions() as db:
+        assert db.scalar(select(User.id).where(User.username == "visitor-created-user")) is not None
+        assert db.scalar(select(Fdr.id).where(Fdr.identifier == "VISITOR-FDR-001")) is not None
+        assert db.scalar(select(User.id).where(User.username == "demo_administrator")) is not None
+
+
+def test_public_demo_allows_authorized_writes_and_keeps_authentication(monkeypatch):
     monkeypatch.setattr(main.settings, "public_demo_mode", True)
 
-    blocked = client.post("/api/fdrs", json={})
-    assert blocked.status_code == 403
-    assert blocked.json()["detail"] == "This public demo is read-only."
-    assert client.get("/api/auth/github/start?registration_id=demo").status_code == 403
-    assert client.get("/api/auth/github/callback?state=demo").status_code == 403
-    assert client.head("/api/auth/github/start?registration_id=demo").status_code == 403
+    unauthorized = client.post("/api/institutions", json={"name": "Demo Academy", "code": f"UNAUTH-{uuid.uuid4().hex[:8]}"})
+    assert unauthorized.status_code == 401
+
+    created = client.post(
+        "/api/institutions",
+        headers=auth_headers(),
+        json={"name": "Shared Demo Academy", "code": f"PUBLIC-WRITE-{uuid.uuid4().hex[:8]}"},
+    )
+    assert created.status_code == 200
+    assert created.json()["name"] == "Shared Demo Academy"
 
     login = client.post("/api/auth/token", data={"username": "not-a-demo-user", "password": "invalid"})
     assert login.status_code == 401

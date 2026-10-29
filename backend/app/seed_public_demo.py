@@ -1,10 +1,10 @@
-"""Seed role-specific synthetic data for the read-only public demo."""
+"""Seed role-specific sample data for the shared public demo."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import Column, MetaData, String, Table, insert, select
 
 from .main import (
     DepositAssessment,
@@ -25,6 +25,12 @@ from .main import (
     pwd_context,
 )
 
+PUBLIC_DEMO_STATE = Table(
+    "public_demo_state",
+    MetaData(),
+    Column("key", String(64), primary_key=True),
+    Column("value", String(255), nullable=False),
+)
 
 PUBLIC_DEMO_PASSWORD = "VaultTrace-Demo-2026!"
 
@@ -64,23 +70,28 @@ VERIFIED_CASE = "DEMO-VERIFICATION-COMPLETE-001"
 def _seed_demo_directory_and_accounts() -> None:
     codes = {f"PUBLIC-DEMO-{index:03d}" for index in range(1, len(INSTITUTIONS) + 1)}
     with SessionLocal() as db:
-        unexpected_users = db.scalars(
-            select(User.username).where(User.username.not_in(tuple(DEMO_ROLES)))
-        ).all()
-        if unexpected_users:
-            raise RuntimeError("Refusing to seed public demo data into a database with non-demo users.")
+        PUBLIC_DEMO_STATE.create(bind=db.get_bind(), checkfirst=True)
+        initialized = db.execute(
+            select(PUBLIC_DEMO_STATE.c.value).where(PUBLIC_DEMO_STATE.c.key == "initialized")
+        ).scalar_one_or_none()
+        if initialized is None:
+            unexpected_users = db.scalars(
+                select(User.username).where(User.username.not_in(tuple(DEMO_ROLES)))
+            ).all()
+            if unexpected_users:
+                raise RuntimeError("Refusing to seed public demo data into a database with non-demo users.")
 
-        unexpected_institutions = db.scalars(
-            select(Institution.code).where(Institution.code.not_in(codes))
-        ).all()
-        if unexpected_institutions:
-            raise RuntimeError("Refusing to seed public demo data into a database with non-demo institutions.")
+            unexpected_institutions = db.scalars(
+                select(Institution.code).where(Institution.code.not_in(codes))
+            ).all()
+            if unexpected_institutions:
+                raise RuntimeError("Refusing to seed public demo data into a database with non-demo institutions.")
 
-        unexpected_fdrs = db.scalars(
-            select(Fdr.identifier).where(~Fdr.identifier.like("DEMO-%"))
-        ).all()
-        if unexpected_fdrs:
-            raise RuntimeError("Refusing to seed public demo data into a database with non-demo FDRs.")
+            unexpected_fdrs = db.scalars(
+                select(Fdr.identifier).where(~Fdr.identifier.like("DEMO-%"))
+            ).all()
+            if unexpected_fdrs:
+                raise RuntimeError("Refusing to seed public demo data into a database with non-demo FDRs.")
 
         for index, name in enumerate(INSTITUTIONS, start=1):
             code = f"PUBLIC-DEMO-{index:03d}"
@@ -274,3 +285,9 @@ def seed_public_demo() -> None:
     seed_policies()
     seed_scenarios()
     _seed_role_examples()
+    with SessionLocal() as db:
+        if db.execute(
+            select(PUBLIC_DEMO_STATE.c.key).where(PUBLIC_DEMO_STATE.c.key == "initialized")
+        ).scalar_one_or_none() is None:
+            db.execute(insert(PUBLIC_DEMO_STATE).values(key="initialized", value="true"))
+            db.commit()

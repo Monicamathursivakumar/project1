@@ -312,7 +312,7 @@ function App() {
       <div className="app-content">
         <Topbar user={user} onSearch={() => setPage("registry")} />
         <main className="content-wrap">
-          {publicDemoMode && <div className="public-demo-banner" role="note"><Icon name="shield" size={16} /><span><b>Read-only public demo</b> All records are synthetic. Changes and uploads are disabled.</span></div>}
+          {publicDemoMode && <div className="public-demo-banner" role="note"><Icon name="shield" size={16} /><span><b>Shared writable demo</b> Changes are visible to other visitors. Seeded records are synthetic; use synthetic documents only. Uploaded files may be lost after a restart.</span></div>}
           <div className="breadcrumbs"><span>VaultTrace</span><b>/</b><strong>{navItems.find((item) => item.id === page)?.label}</strong></div>
           {error && <div className="toast error-toast"><Icon name="alert" size={16} />{error}<button onClick={() => setError("")}><Icon name="close" size={15} /></button></div>}
           <PageContent page={page} setPage={setPage} setError={setError} role={user.role} selectedInstrument={selectedInstrument} selectedDiscrepancyFdrId={selectedDiscrepancyFdrId} openDiscrepancy={openDiscrepancy} selectDiscrepancyInstrument={selectDiscrepancyInstrument} openInstrument={(id) => { setSelectedInstrument(id); setPage("instrument-detail"); }} />
@@ -476,7 +476,7 @@ function LandingPage({ onNavigate, publicDemo }: { onNavigate: (mode: "login" | 
       <div className="landing-final-inner">
         <div className="landing-eyebrow">Start with a clear process</div>
         <h2>Better records make<br /><em>better decisions possible.</em></h2>
-        <p>{publicDemo ? "Explore the synthetic workspace using a read-only role." : "Request access to VaultTrace and follow the review steps for your role."}</p>
+        <p>{publicDemo ? "Explore the shared demo workspace with role-specific access. Changes may be visible to other visitors." : "Request access to VaultTrace and follow the review steps for your role."}</p>
         <div className="landing-actions landing-final-actions">
           {!publicDemo && <button className="button primary" onClick={() => onNavigate("register")}>Create an account request<Icon name="arrow" size={16} /></button>}
           <button className="landing-final-login" onClick={() => onNavigate("login")}>Already have access? Sign in</button>
@@ -624,7 +624,7 @@ function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => v
         </form>
         {(import.meta.env.DEV || publicDemo) && <section className="demo-login" aria-labelledby="demo-login-title">
           <div className="demo-login-heading">
-            <span className="demo-environment"><i /> {publicDemo ? "Public read-only demo" : "Local demo"}</span>
+            <span className="demo-environment"><i /> {publicDemo ? "Shared writable demo" : "Local demo"}</span>
             <h3 id="demo-login-title">Explore by role</h3>
             <p>Choose a demo account to sign in and compare the role-specific workspace.</p>
           </div>
@@ -635,7 +635,7 @@ function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => v
               <span className="demo-role-action">{loading ? "Opening…" : "Sign in"}<Icon name="arrow" size={14} /></span>
             </button>)}
           </div>
-          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>. All hosted sample data is synthetic and read-only.</p>
+          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>. Hosted changes are shared. Use synthetic data only; uploaded files are temporary and can disappear.</p>
         </section>}
       </>}
       {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => {
@@ -1351,20 +1351,17 @@ function Documents({ setError, setPage }: { setError: (s: string) => void; setPa
       eyebrow="MAIN WORKFLOW / INTAKE"
       title="Upload & Analyze FDR"
       description={publicDemoMode
-        ? "Browse synthetic FDR records. Document uploads are disabled in this public read-only demo."
+        ? "Upload a synthetic FDR document, review extracted fields and create a draft. Shared demo uploads are temporary."
         : "Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft."}
     />
     {publicDemoMode
-      ? <div className="info-banner"><Icon name="shield" size={18} /><div><b>Uploads are disabled</b><span>Document uploads and OCR processing are unavailable in the shared demo. Browse the synthetic FDR records instead.</span></div></div>
+      ? <div className="info-banner"><Icon name="shield" size={18} /><div><b>Shared demo · temporary file storage</b><span>Use synthetic documents only. Other visitors may see permitted shared records, and uploaded files may disappear after a restart or redeploy.</span></div></div>
       : <div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div>}
     <section className="analyze-layout">
       <div className="panel analyze-card">
-        <div className="eyebrow">{publicDemoMode ? "READ-ONLY DEMO" : "AUTO OCR"}</div>
-        <h2>{publicDemoMode ? "Document analysis unavailable" : "Upload your FDR document"}</h2>
-        <p>{publicDemoMode
-          ? "This public showcase uses synthetic records only. File selection, upload, extraction, and draft creation are turned off."
-          : "Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository."}</p>
-        {!publicDemoMode && <>
+        <div className="eyebrow">AUTO OCR</div>
+        <h2>Upload your FDR document</h2>
+        <p>Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository.</p>
           <label className="analyze-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
             <input type="file" accept=".pdf,.png,.jpg,.jpeg" onChange={(e) => chooseFile(e.target.files?.[0] || null)} />
             <Icon name="upload" size={28} />
@@ -1398,23 +1395,20 @@ function Documents({ setError, setPage }: { setError: (s: string) => void; setPa
             </ol>
           </div>}
           {message && <div className="success-message"><Icon name={processing ? "clock" : "check"} size={15} />{message}</div>}
-        </>}
       </div>
       <div className="panel analyze-guidance">
-        <div className="eyebrow">{publicDemoMode ? "DEMO DATA" : "CONVERSION FLOW"}</div>
-        <h2>{publicDemoMode ? "Explore synthetic FDR records" : "Manual document → FDR repository"}</h2>
-        {publicDemoMode
-          ? <p>Review the sample instruments in the registry. Changes, uploads, and OCR processing are unavailable in this shared read-only environment.</p>
-          : <div className="conversion-steps">
+        <div className="eyebrow">CONVERSION FLOW</div>
+        <h2>Manual document → FDR repository</h2>
+        <div className="conversion-steps">
             <div><i>1</i><span><b>Upload</b><small>Store the original and SHA-256 fingerprint</small></span></div>
             <div><i>2</i><span><b>Extract</b><small>Run PyMuPDF or Tesseract OCR</small></span></div>
             <div><i>3</i><span><b>Review</b><small>Check candidate fields against the document</small></span></div>
             <div><i>4</i><span><b>Register</b><small>Submit a draft into the FDR master records</small></span></div>
-          </div>}
+        </div>
         <button className="button secondary wide" onClick={() => setPage("registry")}>Open FDR master records <Icon name="arrow" size={16} /></button>
       </div>
     </section>
-    {!publicDemoMode && extracted && <section className="panel extraction-review">
+    {extracted && <section className="panel extraction-review">
       <div><div className="eyebrow">EXTRACTION RESULT</div><h2>Review candidate data before registration</h2><p>{extracted.provider} · {extracted.page_count} page(s) · {extracted.text.length} characters · authenticity unconfirmed</p></div>
       <div className="extracted-text">{extracted.text || "No text was detected. Use the original document and enter values manually."}</div>
       <div className="form-actions">
@@ -1422,7 +1416,7 @@ function Documents({ setError, setPage }: { setError: (s: string) => void; setPa
         <button className="button primary" disabled={processing} onClick={convertToDraft}>{processing ? "Converting…" : "Convert to FDR master-record draft"} <Icon name="arrow" size={16} /></button>
       </div>
     </section>}
-    {!publicDemoMode && showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => { setShowRegistration(false); setWorkflowStage("review"); }} onSaved={(result) => { setShowRegistration(false); setWorkflowStage("complete"); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}
+    {showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => { setShowRegistration(false); setWorkflowStage("review"); }} onSaved={(result) => { setShowRegistration(false); setWorkflowStage("complete"); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}
   </>;
 }
 
