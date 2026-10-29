@@ -1380,11 +1380,11 @@ function Documents({ setError, setPage }: { setError: (s: string) => void; setPa
       eyebrow="MAIN WORKFLOW / INTAKE"
       title="Upload & Analyze FDR"
       description={publicDemoMode
-        ? "Upload a synthetic FDR document, review extracted fields and create a draft. Shared demo uploads are temporary."
+        ? "Start onboarding by uploading a synthetic FDR document. OCR extracts key fields for review before you create a draft."
         : "Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft."}
     />
     {publicDemoMode
-      ? <div className="info-banner"><Icon name="shield" size={18} /><div><b>Shared demo · temporary file storage</b><span>Use synthetic documents only. Other visitors may see permitted shared records, and uploaded files may disappear after a restart or redeploy.</span></div></div>
+      ? <div className="info-banner"><Icon name="shield" size={18} /><div><b>Onboarding & OCR processing</b><span>Follow the intake flow: upload a synthetic document, process it with OCR, review extracted fields, then create an FDR draft. Extracted values are suggestions and require review.</span></div></div>
       : <div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div>}
     <section className="analyze-layout">
       <div className="panel analyze-card">
