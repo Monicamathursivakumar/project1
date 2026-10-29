@@ -941,6 +941,39 @@ def test_public_demo_seeder_accepts_user_data_only_after_initialization(monkeypa
         assert db.scalar(select(User.id).where(User.username == "demo_administrator")) is not None
 
 
+def test_public_demo_registration_samples_are_synthetic_and_idempotent(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'registration-samples.db'}")
+    main.Base.metadata.create_all(engine)
+    isolated_sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    upload_dir = tmp_path / "uploads"
+    monkeypatch.setattr(public_demo_seed, "SessionLocal", isolated_sessions)
+    monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
+
+    public_demo_seed._seed_demo_directory_and_accounts()
+    public_demo_seed._seed_registration_samples()
+    public_demo_seed._seed_registration_samples()
+
+    with isolated_sessions() as db:
+        samples = db.scalars(
+            select(public_demo_seed.RegistrationRequest).order_by(
+                public_demo_seed.RegistrationRequest.username
+            )
+        ).all()
+        assert len(samples) == 4
+        assert sum(sample.status not in {"approved", "rejected"} for sample in samples) == 3
+        assert all(sample.email.endswith("@vaulttrace.invalid") for sample in samples)
+        assert all(sample.identity_document_stored_name for sample in samples)
+        assert db.scalar(select(EmployeeVerification.id)) is not None
+        assert db.scalar(select(RegistrationAuditEvent.id)) is not None
+
+    placeholder = upload_dir / "demo-synthetic-identity-placeholder.png"
+    assert placeholder.is_file()
+    with Image.open(placeholder) as image:
+        assert image.size == (720, 420)
+        assert image.format == "PNG"
+    engine.dispose()
+
+
 def test_public_demo_allows_authorized_writes_and_keeps_authentication(monkeypatch):
     monkeypatch.setattr(main.settings, "public_demo_mode", True)
 

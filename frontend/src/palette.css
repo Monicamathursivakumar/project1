@@ -824,6 +824,18 @@ body,
   color: var(--brand-muted);
 }
 
+.identity-review-evidence > div:not(.identity-review-preview) {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 240px;
+  gap: 4px;
+}
+
+.identity-review-evidence > div:not(.identity-review-preview) > span {
+  color: var(--brand-muted);
+  overflow-wrap: anywhere;
+}
+
 .identity-review-preview {
   display: grid;
   flex-basis: 100%;
@@ -1127,6 +1139,13 @@ body,
 .account-request-title h3 {
   font-size: 15px;
   text-transform: none;
+}
+
+.account-request-title > .status {
+  max-width: 42%;
+  flex: 0 0 auto;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .account-request-title span,

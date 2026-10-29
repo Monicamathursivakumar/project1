@@ -959,6 +959,7 @@ function AccountApprovals({ role, setError }: { role: string; setError: (message
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const isAdmin = role === "admin";
+  const canReviewRegistrations = isAdmin || role === "reviewer";
   useEffect(() => {
     if (!identityDocumentPreview) return;
     return () => URL.revokeObjectURL(identityDocumentPreview.url);
@@ -999,7 +1000,13 @@ function AccountApprovals({ role, setError }: { role: string; setError: (message
       setBusy(null);
     }
   };
-  useEffect(() => { void load(); }, [role]);
+  useEffect(() => {
+    if (!canReviewRegistrations) {
+      setLoading(false);
+      return;
+    }
+    void load();
+  }, [role]);
   const decide = async (item: RegistrationReview, action: string) => {
     const reason = reasons[item.id]?.trim() || "";
     if (reason.length < 3) { setError("Enter a decision reason of at least 3 characters before taking action."); return; }
@@ -1052,6 +1059,13 @@ function AccountApprovals({ role, setError }: { role: string; setError: (message
     approve_role: "Approve account",
     reject: "Reject request",
   };
+  if (!canReviewRegistrations) return <>
+    <PageHeader eyebrow="ADMINISTRATION / ACCESS" title="Account approvals" description="Registration requests are restricted to administrators and reviewing officers." />
+    <section className="panel account-approval-list" role="status">
+      <h2>Reviewer access required</h2>
+      <p>Sign out and choose the Administrator or Reviewing Officer demo role to review synthetic applications.</p>
+    </section>
+  </>;
   return <>
     <PageHeader eyebrow="ADMINISTRATION / ACCESS" title="Account approvals" description="Review applications, inspect submitted details and ID-card evidence, and record each decision." />
     <section className="panel account-approval-list">
