@@ -122,42 +122,48 @@ creates `demo_institution_user`, `demo_reviewing_officer`,
 not reset or duplicated. Demo staff are associated with the first institution
 in the local catalogue; institution-user records are scoped to that college.
 
-## Deploy to Render
+## Deploy a free read-only Render demo
 
 The root `render.yaml` Blueprint defines a Vite static site, Docker-based FastAPI
-service, managed PostgreSQL database and persistent disk for private uploads.
-The API uses the database's internal connection string, stores uploaded files on
-the mounted disk, and allows browser requests from the deployed frontend only.
-The frontend API URL is configured from the API service host at build time.
+service and Render Postgres database using free plans. The frontend API URL and
+browser CORS origin are linked to the deployed service URLs.
 
-1. Push this repository to a Git provider connected to Render.
-2. In Render, choose **New → Blueprint**, select the repository, and review the
-   services and paid resources defined in `render.yaml`. The API service needs a
-   paid instance for its persistent upload disk, and PostgreSQL is billed
-   separately.
-3. When prompted, set `INITIAL_ADMIN_PASSWORD` to a unique password of at least
-   12 characters. Render generates `SECRET_KEY` and `BOOTSTRAP_TOKEN`; do not
-   expose either value.
-4. After the deployment is live, open the API service's **Environment** page and
-   copy `BOOTSTRAP_TOKEN`. Create the first administrator once:
+When the API starts, `PUBLIC_DEMO_MODE` creates synthetic institutions,
+role-specific FDR workflows and public demo accounts in an empty demo database.
+The frontend displays role sign-in cards. All API requests that can change data
+are rejected; only sign-in and read requests are allowed. The demo credentials
+are public by design: `VaultTrace-Demo-2026!`. Do not reuse this deployment or
+password for real records or production.
 
-   ```powershell
-   curl.exe -X POST https://<api-service-host>/api/auth/bootstrap `
-     -H "X-Bootstrap-Token: <bootstrap-token>"
-   ```
+This is for a temporary demo, not production:
 
-   Sign in as `admin` using the `INITIAL_ADMIN_PASSWORD` set for the service.
-   The one-time bootstrap endpoint rejects requests without the generated
-   token when this deployment setting is enabled.
-5. Open the frontend service URL. For custom domains, update the API service's
-   `CORS_ORIGINS` to the frontend origin (scheme included, such as
-   `https://vaulttrace.example.com`) and redeploy the API.
+- Free web services spin down after 15 minutes without traffic and can take
+  about a minute to start again.
+- The free database has a 1 GB limit, expires 30 days after creation, and has
+  no backups. Render deletes it after the 14-day post-expiration grace period.
+- Uploads go to the API's ephemeral filesystem and are lost on service restart,
+  spin-down or redeploy. Do not upload real or sensitive documents.
+- Account registration, password reset and other write workflows are disabled
+  in this read-only demo.
+- Every record is synthetic. The API refuses to seed if it finds non-demo users,
+  institutions or FDRs in the database.
 
-The deployment starts with an empty database; use the application to add
-institutions and records. Uploaded documents persist on the API disk and are
-served only through authenticated API endpoints. Back up the database and
-uploaded files before production use. Local files in `backend/private_uploads`
-and the SQLite development database are not uploaded to Render.
+To deploy:
+
+1. Push the repository to a Git provider connected to Render. Do not commit
+   `backend/.env`, local databases, secrets or uploaded files.
+2. In Render, choose **New → Blueprint**, select the repository, review the
+   free resources in `render.yaml`, and create the Blueprint.
+3. Render generates the API `SECRET_KEY`. Do not expose it.
+4. Open the frontend service URL and sign in using one of the role cards and the
+   displayed shared demo password. Sample records are seeded automatically on
+   the first API startup and repaired idempotently after restarts.
+
+For production, do not use the free plan. Upgrade the API and Postgres to paid
+plans, attach persistent upload storage or use private object storage, configure
+backups and an email provider, and review the security and privacy setup before
+handling real documents. Local files in `backend/private_uploads` and the
+SQLite development database are not uploaded to Render.
 
 ### Load the AICTE institution catalogue
 

@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { demoAccounts, type DemoAccount } from "./demoAccounts";
 import "./styles.css";
 import "./palette.css";
 
@@ -8,21 +9,11 @@ const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, ""
 const API = configuredApiUrl
   ? /^https?:\/\//i.test(configuredApiUrl) ? configuredApiUrl : `https://${configuredApiUrl}`
   : "http://127.0.0.1:8000";
+const publicDemoMode = import.meta.env.VITE_PUBLIC_DEMO === "true";
 
 type Summary = { institutions: number; fdrs: number; verified: number; pending: number };
 type User = { id: number; username: string; role: string };
-type DemoAccount = { username: string; label: string; role: string; description: string };
 const demoPassword = "VaultTrace-Demo-2026!";
-const demoAccounts: DemoAccount[] = [
-  { username: "demo_institution_user", label: "Institution User", role: "Institution User", description: "Institution-scoped FDR records" },
-  { username: "demo_reviewing_officer", label: "Reviewing Officer", role: "Reviewing Officer", description: "Review and discrepancy queues" },
-  { username: "demo_verification_officer", label: "Verification Officer", role: "Verification Officer", description: "Instrument verification work" },
-  { username: "demo_custody_officer", label: "Custody Officer", role: "Custody Officer", description: "Custody register and handovers" },
-  { username: "demo_policy_administrator", label: "Policy Administrator", role: "Policy Administrator", description: "View policy configuration" },
-  { username: "demo_auditor", label: "Auditor", role: "Auditor", description: "Read-only audit and reports" },
-  { username: "demo_administrator", label: "Administrator", role: "Administrator", description: "User and system administration" },
-  { username: "demo_viewer", label: "Viewer", role: "Viewer", description: "Read-only workspace access" },
-];
 type Institution = { id: number; name: string; code: string; address: string; aicte_id?: string; other_id?: string; district: string; state: string; institution_type: string; women: string; minority: string; university: string };
 type RegistrationInstitution = { id: number; name: string; code: string };
 type RegistrationStatus = { registration_id: string; account_type: string; status: string; email_verification: string; identity_verification: string; employee_verification: string; institution_association: string; role_approval: string; updated_at: string; decision_reason?: string };
@@ -35,6 +26,7 @@ type DiscrepancyHistory = { id: number; actor_id: number; action: string; reason
 type Discrepancy = { id: number; fdr_id: number; rule_id: string; title?: string; affected_field?: string; severity: string; explanation: string; expected_value: string; expected_source?: string; observed_value: string; observed_source?: string; evidence_reference?: string; evidence_document_ids?: number[]; recommended_action?: string; analysis_method?: string; status: string; review_status?: string; resolution_notes: string; history?: DiscrepancyHistory[] };
 type DiscrepancyChatMessage = { role: "user" | "assistant"; text: string; sources?: string[] };
 type DocumentRow = { id: number; fdr_id: number; original_name: string; sha256: string; content_type: string; size: number; created_at: string };
+type RecentUpload = { id: number; fdr_id: number; identifier: string; original_name: string; content_type: string; size: number; created_at: string; status: string };
 type TimelineRow = { id: number; from_status: string; to_status: string; reason?: string; created_at: string };
 type CustodyRow = { id: number; event_type: string; location: string; custodian: string; received_at: string; created_at: string };
 type VersionRow = { id: number; version_number: number; change_reason: string; created_at: string; snapshot: string };
@@ -42,12 +34,42 @@ type AuditRow = { id: number; actor_id: number; action: string; entity: string; 
 type ReleaseRow = { id: number; fdr_id: number; request_type: string; reason: string; status: string; created_at: string };
 type Page = "overview" | "institutions" | "registry" | "instrument-detail" | "verification" | "documents" | "discrepancies" | "release" | "maturity" | "custody" | "reports" | "audit" | "policies" | "accounts";
 
+const registryStatusOrder = ["draft", "verified", "executed", "under_review", "submitted", "closed", "release_requested", "approved", "rejected"];
+const registryStatusColors: Record<string, string> = {
+  draft: "#94a3b8",
+  verified: "#16a085",
+  executed: "#5266c7",
+  under_review: "#e5a323",
+  submitted: "#d97925",
+  closed: "#64748b",
+  release_requested: "#8b5fc0",
+  approved: "#2b8a57",
+  rejected: "#cf4b4b",
+};
+
+function registryStatusGradient(statuses: Record<string, number>) {
+  const entries = [
+    ...registryStatusOrder.filter((status) => statuses[status]).map((status) => [status, statuses[status]] as const),
+    ...Object.entries(statuses).filter(([status, count]) => count > 0 && !registryStatusOrder.includes(status)),
+  ];
+  const total = entries.reduce((sum, [, count]) => sum + count, 0);
+  if (!total) return "conic-gradient(#e5eaf0 0 100%)";
+
+  let position = 0;
+  const stops = entries.map(([status, count]) => {
+    const start = position;
+    position += (count / total) * 100;
+    return `${registryStatusColors[status] || "#64748b"} ${start}% ${position}%`;
+  });
+  return `conic-gradient(${stops.join(", ")})`;
+}
+
 const navItems: { id: Page; label: string; group: string; icon: string }[] = [
   { id: "overview", label: "Overview", group: "Workspace", icon: "grid" },
   { id: "institutions", label: "Institution directory", group: "Workspace", icon: "building" },
   { id: "registry", label: "FDR records", group: "Workspace", icon: "file" },
-  { id: "verification", label: "Verification centre", group: "Operations", icon: "shield" },
   { id: "documents", label: "Upload & Analyze FDR", group: "Operations", icon: "upload" },
+  { id: "verification", label: "Verification centre", group: "Operations", icon: "shield" },
   { id: "discrepancies", label: "Discrepancies", group: "Operations", icon: "alert" },
   { id: "release", label: "Release / refund", group: "Lifecycle", icon: "arrow" },
   { id: "maturity", label: "Maturity calendar", group: "Lifecycle", icon: "clock" },
@@ -266,7 +288,7 @@ function App() {
     request<User>("/api/auth/me").then(setUser).catch(() => localStorage.removeItem("vaulttrace_token")).finally(() => setBooting(false));
   }, []);
 
-  if (booting) return <div className="loading-screen"><img className="brand-logo loading-logo" src="/aicte-logo.png" alt="AICTE logo" /><span>Loading secure workspace…</span></div>;
+  if (booting) return <div className="portal-frame"><PortalUtilityBar /><div className="loading-screen"><img className="brand-logo loading-logo" src="/aicte-logo.png" alt="AICTE logo" /><span>Loading secure workspace…</span></div></div>;
   if (!user) {
     const openAuth = (mode: "login" | "register") => {
       const params = new URLSearchParams();
@@ -278,25 +300,64 @@ function App() {
       window.history.pushState(null, "", window.location.pathname);
       setPublicScreen("landing");
     };
-    if (publicScreen === "landing") return <LandingPage onNavigate={openAuth} />;
-    return <Login onLogin={setUser} onBackHome={backToLanding} />;
+    if (publicScreen === "landing") return <div className="portal-frame"><PortalUtilityBar /><LandingPage onNavigate={openAuth} publicDemo={publicDemoMode} /></div>;
+    return <div className="portal-frame"><PortalUtilityBar /><Login onLogin={setUser} onBackHome={backToLanding} publicDemo={publicDemoMode} /></div>;
   }
 
   const logout = () => { localStorage.removeItem("vaulttrace_token"); setUser(null); setPublicScreen("auth"); };
-  return <div className="app-shell">
-    <Sidebar page={page} setPage={setPage} role={user.role} onLogout={logout} />
-    <div className="app-content">
-      <Topbar user={user} onSearch={() => setPage("registry")} />
-      <main className="content-wrap">
-        <div className="breadcrumbs"><span>VaultTrace</span><b>/</b><strong>{navItems.find((item) => item.id === page)?.label}</strong></div>
-        {error && <div className="toast error-toast"><Icon name="alert" size={16} />{error}<button onClick={() => setError("")}><Icon name="close" size={15} /></button></div>}
-        <PageContent page={page} setPage={setPage} setError={setError} role={user.role} selectedInstrument={selectedInstrument} selectedDiscrepancyFdrId={selectedDiscrepancyFdrId} openDiscrepancy={openDiscrepancy} selectDiscrepancyInstrument={selectDiscrepancyInstrument} openInstrument={(id) => { setSelectedInstrument(id); setPage("instrument-detail"); }} />
-      </main>
+  return <div className="portal-frame">
+    <PortalUtilityBar />
+    <div className="app-shell">
+      <Sidebar page={page} setPage={setPage} role={user.role} onLogout={logout} />
+      <div className="app-content">
+        <Topbar user={user} onSearch={() => setPage("registry")} />
+        <main className="content-wrap">
+          {publicDemoMode && <div className="public-demo-banner" role="note"><Icon name="shield" size={16} /><span><b>Read-only public demo</b> All records are synthetic. Changes and uploads are disabled.</span></div>}
+          <div className="breadcrumbs"><span>VaultTrace</span><b>/</b><strong>{navItems.find((item) => item.id === page)?.label}</strong></div>
+          {error && <div className="toast error-toast"><Icon name="alert" size={16} />{error}<button onClick={() => setError("")}><Icon name="close" size={15} /></button></div>}
+          <PageContent page={page} setPage={setPage} setError={setError} role={user.role} selectedInstrument={selectedInstrument} selectedDiscrepancyFdrId={selectedDiscrepancyFdrId} openDiscrepancy={openDiscrepancy} selectDiscrepancyInstrument={selectDiscrepancyInstrument} openInstrument={(id) => { setSelectedInstrument(id); setPage("instrument-detail"); }} />
+        </main>
+      </div>
     </div>
   </div>;
 }
 
-function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") => void }) {
+function PortalUtilityBar() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const dateTime = new Intl.DateTimeFormat("en-IN", {
+    weekday: "long",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }).format(now);
+
+  return <div className="portal-utility-bar">
+    <div className="portal-utility-inner">
+      <div className="portal-utility-info">
+        <time dateTime={now.toISOString()}>{dateTime}</time>
+        <span className="portal-reader-label"><span aria-hidden="true">◖))</span> Screen Reader Access</span>
+      </div>
+      <div className="portal-utility-actions" aria-label="Portal accessibility and language tools">
+        <span className="portal-text-size">Text Size</span>
+        <span className="portal-size-options" aria-label="Text size options"><span>A-</span><span>A</span><span>A<sup>+</sup></span></span>
+        <span className="portal-language"><span aria-hidden="true">अ</span> हिन्दी</span>
+        <span className="portal-login-pill"><span aria-hidden="true">♟</span> Web Portal Login</span>
+        <span className="portal-social" aria-hidden="true"><b>f</b><b>𝕏</b><b>◉</b></span>
+      </div>
+    </div>
+  </div>;
+}
+
+function LandingPage({ onNavigate, publicDemo }: { onNavigate: (mode: "login" | "register") => void; publicDemo: boolean }) {
   const workflowStages = [
     ["01", "Submit", "Register an account and provide the details needed for review."],
     ["02", "Verify", "Track email, identity, employee and institution checks separately."],
@@ -325,7 +386,7 @@ function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") 
         <a href="#workflow">How it works</a>
         <a href="#capabilities">Platform</a>
         <button className="landing-signin" onClick={() => onNavigate("login")}>Sign in</button>
-        <button className="button primary landing-nav-cta" onClick={() => onNavigate("register")}>Request access<Icon name="arrow" size={15} /></button>
+        {!publicDemo && <button className="button primary landing-nav-cta" onClick={() => onNavigate("register")}>Request access<Icon name="arrow" size={15} /></button>}
       </nav>
     </header>
 
@@ -336,7 +397,7 @@ function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") 
           <h1>Every deposit.<br /><em>Clear status.</em><br />Accountable decisions.</h1>
           <p>VaultTrace brings institution records, fixed deposit receipts and review workflows into one carefully controlled workspace.</p>
           <div className="landing-actions">
-            <button className="button primary" onClick={() => onNavigate("register")}>Request account access<Icon name="arrow" size={16} /></button>
+            {!publicDemo && <button className="button primary" onClick={() => onNavigate("register")}>Request account access<Icon name="arrow" size={16} /></button>}
             <a className="landing-secondary-action" href="#workflow"><span className="landing-play">↓</span> Explore the workflow</a>
           </div>
           <div className="landing-assurance"><Icon name="shield" size={16} /><span>Access is role-based. Decisions are recorded. Evidence remains reviewable.</span></div>
@@ -391,7 +452,7 @@ function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") 
           <div className="landing-eyebrow">Built around responsible operations</div>
           <h2>Information in context.<br /><em>Action with accountability.</em></h2>
           <p>VaultTrace is designed to help teams move from record handling to informed, traceable decisions—without treating automation as proof.</p>
-          <button className="landing-outline-button" onClick={() => onNavigate("register")}>See the workflow in action<Icon name="arrow" size={15} /></button>
+          {!publicDemo && <button className="landing-outline-button" onClick={() => onNavigate("register")}>See the workflow in action<Icon name="arrow" size={15} /></button>}
         </div>
         <div className="landing-capability-list">
           {capabilities.map(([title, description], index) => <article className="landing-capability" key={title}>
@@ -415,9 +476,9 @@ function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") 
       <div className="landing-final-inner">
         <div className="landing-eyebrow">Start with a clear process</div>
         <h2>Better records make<br /><em>better decisions possible.</em></h2>
-        <p>Request access to VaultTrace and follow the review steps for your role.</p>
+        <p>{publicDemo ? "Explore the synthetic workspace using a read-only role." : "Request access to VaultTrace and follow the review steps for your role."}</p>
         <div className="landing-actions landing-final-actions">
-          <button className="button primary" onClick={() => onNavigate("register")}>Create an account request<Icon name="arrow" size={16} /></button>
+          {!publicDemo && <button className="button primary" onClick={() => onNavigate("register")}>Create an account request<Icon name="arrow" size={16} /></button>}
           <button className="landing-final-login" onClick={() => onNavigate("login")}>Already have access? Sign in</button>
         </div>
       </div>
@@ -430,7 +491,7 @@ function LandingPage({ onNavigate }: { onNavigate: (mode: "login" | "register") 
   </main>;
 }
 
-function Login({ onLogin, onBackHome }: { onLogin: (user: User) => void; onBackHome: () => void }) {
+function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => void; onBackHome: () => void; publicDemo: boolean }) {
   const params = new URLSearchParams(window.location.search);
   const [mode, setMode] = useState<"login" | "register" | "status" | "forgot" | "reset">(
     params.has("resetPassword") ? "reset" : params.has("registrationId") || params.get("auth") === "status" ? "status" : params.get("auth") === "register" ? "register" : "login",
@@ -554,16 +615,16 @@ function Login({ onLogin, onBackHome }: { onLogin: (user: User) => void; onBackH
       {error && <div className="form-error auth-message" role="alert"><Icon name="alert" size={15} />{error}</div>}
       {mode === "login" && <>
         <form onSubmit={submit}>
-          <label htmlFor="login-username">Username<input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" required={!import.meta.env.DEV} /></label>
-          <label htmlFor="login-password">Password<input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required={!import.meta.env.DEV} /></label>
+          <label htmlFor="login-username">Username<input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" required={!import.meta.env.DEV && !publicDemo} /></label>
+          <label htmlFor="login-password">Password<input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required={!import.meta.env.DEV && !publicDemo} /></label>
           <button className="button primary wide" disabled={loading}>{loading ? "Opening workspace…" : "Sign in securely"}<Icon name="arrow" size={17} /></button>
-          <div className="auth-links"><button type="button" onClick={() => switchMode("register")}>Create Account</button><button type="button" onClick={() => switchMode("forgot")}>Forgot Password?</button></div>
-          <button className="auth-text-button" type="button" onClick={() => switchMode("status")}>Check registration status / resend verification</button>
-          <button className="auth-text-button" type="button" onClick={() => { setError(""); setNotice("Contact your VaultTrace system administrator through your organization’s support channel."); }}>Contact Administrator</button>
+          {!publicDemo && <><div className="auth-links"><button type="button" onClick={() => switchMode("register")}>Create Account</button><button type="button" onClick={() => switchMode("forgot")}>Forgot Password?</button></div>
+            <button className="auth-text-button" type="button" onClick={() => switchMode("status")}>Check registration status / resend verification</button>
+            <button className="auth-text-button" type="button" onClick={() => { setError(""); setNotice("Contact your VaultTrace system administrator through your organization’s support channel."); }}>Contact Administrator</button></>}
         </form>
-        {import.meta.env.DEV && <section className="demo-login" aria-labelledby="demo-login-title">
+        {(import.meta.env.DEV || publicDemo) && <section className="demo-login" aria-labelledby="demo-login-title">
           <div className="demo-login-heading">
-            <span className="demo-environment"><i /> Local demo</span>
+            <span className="demo-environment"><i /> {publicDemo ? "Public read-only demo" : "Local demo"}</span>
             <h3 id="demo-login-title">Explore by role</h3>
             <p>Choose a demo account to sign in and compare the role-specific workspace.</p>
           </div>
@@ -574,7 +635,7 @@ function Login({ onLogin, onBackHome }: { onLogin: (user: User) => void; onBackH
               <span className="demo-role-action">{loading ? "Opening…" : "Sign in"}<Icon name="arrow" size={14} /></span>
             </button>)}
           </div>
-          <p className="demo-password-note">Shared demo password <code>{demoPassword}</code>. Demo shortcuts are available only in local development.</p>
+          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>. All hosted sample data is synthetic and read-only.</p>
         </section>}
       </>}
       {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => {
@@ -876,7 +937,7 @@ function PageContent({ page, setPage, setError, role, selectedInstrument, select
     case "audit": return <Audit setError={setError} />;
     case "policies": return <Policies setError={setError} role={role} />;
     case "accounts": return <AccountApprovals role={role} setError={setError} />;
-    default: return <Overview setPage={setPage} setError={setError} />;
+    default: return <Overview setPage={setPage} setError={setError} openInstrument={openInstrument} />;
   }
 }
 
@@ -1069,13 +1130,81 @@ function AccountApprovals({ role, setError }: { role: string; setError: (message
   </>;
 }
 
-function Overview({ setPage, setError }: { setPage: (p: Page) => void; setError: (s: string) => void }) {
+function Overview({ setPage, setError, openInstrument }: { setPage: (p: Page) => void; setError: (s: string) => void; openInstrument: (id: number) => void }) {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [fdrs, setFdrs] = useState<Fdr[]>([]);
   const [directory, setDirectory] = useState<InstitutionSummary | null>(null);
-  useEffect(() => { Promise.all([request<Summary>("/api/dashboard/summary"), request<Fdr[]>("/api/fdrs"), request<InstitutionSummary>("/api/institutions/summary")]).then(([s, f, d]) => { setSummary(s); setFdrs(f); setDirectory(d); }).catch((e) => setError(e.message)); }, [setError]);
+  const [recentUploads, setRecentUploads] = useState<RecentUpload[]>([]);
+  useEffect(() => { Promise.all([request<Summary>("/api/dashboard/summary"), request<Fdr[]>("/api/fdrs"), request<InstitutionSummary>("/api/institutions/summary"), request<RecentUpload[]>("/api/dashboard/recent-uploads")]).then(([s, f, d, uploads]) => { setSummary(s); setFdrs(f); setDirectory(d); setRecentUploads(uploads); }).catch((e) => setError(e.message)); }, [setError]);
   const statuses = useMemo(() => fdrs.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] || 0) + 1; return acc; }, {}), [fdrs]);
-  return <><PageHeader eyebrow="OPERATIONS / OVERVIEW" title="Good morning, administrator" description="Here’s the current pulse of your deposit registry." action={<button className="button primary" onClick={() => setPage("registry")}><Icon name="plus" size={16} />Register an FDR</button>} /><section className="metric-grid">{[["institutions", "Institutions under management", "building", "neutral"], ["fdrs", "Registered instruments", "file", "blue"], ["verified", "Verified instruments", "shield", "teal"], ["pending", "Cases needing attention", "alert", "amber"]].map(([key, label, icon, tone]) => <div className="metric-card" key={key}><div className={`metric-icon ${tone}`}><Icon name={icon} /></div><div><span>{label}</span><strong>{summary?.[key as keyof Summary] ?? "—"}</strong><small>{key === "pending" ? "Review queue" : "Live database count"}</small></div></div>)}</section><section className="panel table-panel"><div className="panel-heading"><div><h2>Institution catalogue coverage</h2><p>AICTE directory data available for operational scenarios</p></div><button className="text-button" onClick={() => setPage("institutions")}>Explore directory <Icon name="arrow" size={15} /></button></div><div className="metric-grid"><div className="metric-card"><div className="metric-icon blue"><Icon name="building" /></div><div><span>Catalogue institutions</span><strong>{directory?.institutions ?? "—"}</strong><small>{directory?.states.length ?? 0} states / territories</small></div></div><div className="metric-card"><div className="metric-icon teal"><Icon name="list" /></div><div><span>Programme offerings</span><strong>{directory?.programmes ?? "—"}</strong><small>{directory?.institution_types.length ?? 0} institution types</small></div></div></div></section><div className="dashboard-grid"><section className="panel chart-panel"><div className="panel-heading"><div><h2>Registry health</h2><p>Current instrument status distribution</p></div><button className="text-button" onClick={() => setPage("registry")}>View registry <Icon name="arrow" size={15} /></button></div><div className="health-visual"><div className="donut" style={{ "--progress": `${Math.min(100, ((summary?.verified || 0) / Math.max(1, summary?.fdrs || 1)) * 100)}%` } as CSSProperties}><div><strong>{summary?.fdrs || 0}</strong><span>total FDRs</span></div></div><div className="legend">{Object.entries(statuses).length ? Object.entries(statuses).map(([status, count]) => <div key={status}><i className={`legend-dot dot-${status}`} /><span>{status.replace(/_/g, " ")}</span><b>{count}</b></div>) : <EmptyState text="No instruments have been registered yet." />}</div></div></section><section className="panel action-panel"><div className="panel-heading"><div><h2>Quick actions</h2><p>Move work forward</p></div></div><button onClick={() => setPage("institutions")}><span className="quick-icon blue"><Icon name="building" /></span><span><b>Review institutions</b><small>Manage directory records</small></span><Icon name="arrow" size={16} /></button><button onClick={() => setPage("verification")}><span className="quick-icon teal"><Icon name="shield" /></span><span><b>Open verification queue</b><small>{summary?.pending || 0} cases waiting</small></span><Icon name="arrow" size={16} /></button><button onClick={() => setPage("discrepancies")}><span className="quick-icon amber"><Icon name="alert" /></span><span><b>Resolve discrepancies</b><small>Keep the registry clean</small></span><Icon name="arrow" size={16} /></button></section></div><section className="panel table-panel"><div className="panel-heading"><div><h2>Recent instruments</h2><p>Latest records entering the registry</p></div><button className="text-button" onClick={() => setPage("registry")}>View all <Icon name="arrow" size={15} /></button></div><FdrTable rows={fdrs.slice(0, 5)} /></section></>;
+  const chartStatuses = registryStatusOrder
+    .filter((status) => statuses[status])
+    .map((status) => [status, statuses[status]] as const);
+  const unlistedStatuses = Object.entries(statuses).filter(([status]) => !registryStatusOrder.includes(status));
+  const orderedStatuses = [...chartStatuses, ...unlistedStatuses];
+  return <>
+    <PageHeader
+      eyebrow="OPERATIONS / OVERVIEW"
+      title="Good morning, administrator"
+      description="Here’s the current pulse of your deposit registry."
+      action={<button className="button primary" onClick={() => setPage("registry")}><Icon name="plus" size={16} />Register an FDR</button>}
+    />
+    <section className="metric-grid">
+      {[["institutions", "Institutions under management", "building", "neutral"], ["fdrs", "Registered instruments", "file", "blue"], ["verified", "Verified instruments", "shield", "teal"], ["pending", "Cases needing attention", "alert", "amber"]].map(([key, label, icon, tone]) => (
+        <div className="metric-card" key={key}>
+          <div className={`metric-icon ${tone}`}><Icon name={icon} /></div>
+          <div><span>{label}</span><strong>{summary?.[key as keyof Summary] ?? "—"}</strong><small>{key === "pending" ? "Review queue" : "Live database count"}</small></div>
+        </div>
+      ))}
+    </section>
+    <section className="panel table-panel">
+      <div className="panel-heading">
+        <div><h2>Institution catalogue coverage</h2><p>AICTE directory data available for operational scenarios</p></div>
+        <button className="text-button" onClick={() => setPage("institutions")}>Explore directory <Icon name="arrow" size={15} /></button>
+      </div>
+      <div className="metric-grid">
+        <div className="metric-card"><div className="metric-icon blue"><Icon name="building" /></div><div><span>Catalogue institutions</span><strong>{directory?.institutions ?? "—"}</strong><small>{directory?.states.length ?? 0} states / territories</small></div></div>
+        <div className="metric-card"><div className="metric-icon teal"><Icon name="list" /></div><div><span>Programme offerings</span><strong>{directory?.programmes ?? "—"}</strong><small>{directory?.institution_types.length ?? 0} institution types</small></div></div>
+      </div>
+    </section>
+    <div className="dashboard-grid">
+      <section className="panel chart-panel">
+        <div className="panel-heading"><div><h2>Registry health</h2><p>Current instrument status distribution</p></div><button className="text-button" onClick={() => setPage("registry")}>View registry <Icon name="arrow" size={15} /></button></div>
+        <div className="health-visual">
+          <div className="donut" style={{ background: registryStatusGradient(statuses) }}><div><strong>{summary?.fdrs || 0}</strong><span>total FDRs</span></div></div>
+          <div className="legend">{orderedStatuses.length ? orderedStatuses.map(([status, count]) => <div key={status}><i className={`legend-dot dot-${status}`} style={{ "--status-color": registryStatusColors[status] || "#64748b" } as CSSProperties} /><span>{status.replace(/_/g, " ")}</span><b>{count}</b></div>) : <EmptyState text="No instruments have been registered yet." />}</div>
+        </div>
+      </section>
+      <section className="panel action-panel">
+        <div className="panel-heading"><div><h2>Quick actions</h2><p>Move work forward</p></div></div>
+        <button onClick={() => setPage("institutions")}><span className="quick-icon blue"><Icon name="building" /></span><span><b>Review institutions</b><small>Manage directory records</small></span><Icon name="arrow" size={16} /></button>
+        <button onClick={() => setPage("verification")}><span className="quick-icon teal"><Icon name="shield" /></span><span><b>Open verification queue</b><small>{summary?.pending || 0} cases waiting</small></span><Icon name="arrow" size={16} /></button>
+        <button onClick={() => setPage("discrepancies")}><span className="quick-icon amber"><Icon name="alert" /></span><span><b>Resolve discrepancies</b><small>Keep the registry clean</small></span><Icon name="arrow" size={16} /></button>
+      </section>
+    </div>
+    <section className="panel table-panel">
+      <div className="panel-heading"><div><h2>Recent instruments</h2><p>Latest records entering the registry</p></div><button className="text-button" onClick={() => setPage("registry")}>View all <Icon name="arrow" size={15} /></button></div>
+      <FdrTable rows={fdrs.slice(0, 5)} onOpen={openInstrument} />
+    </section>
+    <section className="panel table-panel">
+      <div className="panel-heading"><div><h2>Recent uploads</h2><p>Documents uploaded to the registry, independent of instrument status</p></div></div>
+      <table>
+        <thead><tr><th>Document</th><th>FDR record</th><th>Uploaded</th><th>Size</th><th>Status</th><th /></tr></thead>
+        <tbody>
+          {recentUploads.length ? recentUploads.map((upload) => (
+            <tr key={upload.id}>
+              <td><b>{upload.original_name}</b></td>
+              <td>{upload.identifier}</td>
+              <td>{new Date(upload.created_at).toLocaleString("en-IN")}</td>
+              <td>{upload.size < 1024 * 1024 ? `${(upload.size / 1024).toFixed(0)} KB` : `${(upload.size / (1024 * 1024)).toFixed(1)} MB`}</td>
+              <td><StatusBadge value={upload.status} /></td>
+              <td className="align-right"><button className="row-action" onClick={() => openInstrument(upload.fdr_id)}>Open FDR <Icon name="arrow" size={14} /></button></td>
+            </tr>
+          )) : <tr><td colSpan={6}><EmptyState text="No documents have been uploaded yet." /></td></tr>}
+        </tbody>
+      </table>
+    </section>
+  </>;
 }
 
 function Institutions({ setError, role }: { setError: (s: string) => void; role: string }) {
@@ -1194,13 +1323,30 @@ function Verification({ setPage, setError, openDiscrepancy }: { setPage: (p: Pag
 }
 
 function Documents({ setError, setPage }: { setError: (s: string) => void; setPage: (page: Page) => void }) {
-  const [fdrs, setFdrs] = useState<Fdr[]>([]); const [institutions, setInstitutions] = useState<Institution[]>([]); const [selected, setSelected] = useState(""); const [file, setFile] = useState<File | null>(null); const [message, setMessage] = useState(""); const [processing, setProcessing] = useState(false); const [extracted, setExtracted] = useState<{ id: number; document_id: number; provider: string; text: string; page_count: number; authenticity_confirmed: boolean } | null>(null); const [draftValues, setDraftValues] = useState<FdrDraftValues>({}); const [showRegistration, setShowRegistration] = useState(false);
+  const [fdrs, setFdrs] = useState<Fdr[]>([]); const [institutions, setInstitutions] = useState<Institution[]>([]); const [selected, setSelected] = useState(""); const [file, setFile] = useState<File | null>(null); const [message, setMessage] = useState(""); const [processing, setProcessing] = useState(false); const [workflowStage, setWorkflowStage] = useState<"upload" | "extract" | "review" | "register" | "complete" | null>(null); const [extracted, setExtracted] = useState<{ id: number; document_id: number; provider: string; text: string; page_count: number; authenticity_confirmed: boolean } | null>(null); const [draftValues, setDraftValues] = useState<FdrDraftValues>({}); const [showRegistration, setShowRegistration] = useState(false);
+  useEffect(() => { if (!processing && workflowStage) setWorkflowStage(null); }, [processing, workflowStage]);
   useEffect(() => { Promise.all([request<Fdr[]>("/api/fdrs"), request<Institution[]>("/api/institutions")]).then(([rows, directory]) => { setFdrs(rows); const known = new Set(directory.map((item) => item.id)); const fallbacks = rows.filter((row) => !known.has(row.institution_id)).map((row) => ({ id: row.institution_id, name: row.joint_holder || row.holder_name || `Institution #${row.institution_id}`, code: `FDR-${row.institution_id}`, address: "", district: "", state: "", institution_type: "", women: "", minority: "", university: "" })); setInstitutions([...directory, ...fallbacks]); }).catch((e) => setError(e.message)); }, [setError]);
-  const chooseFile = (candidate: File | null) => { if (!candidate) return; if (candidate.size > 10 * 1024 * 1024) { setError("The document must be smaller than 10 MB."); return; } setFile(candidate); setMessage(""); setExtracted(null); };
-  const analyze = async () => { if (!file) { setError("Choose an FDR document first."); return; } const target = selected || fdrs[0]?.id?.toString(); if (!target) { setError("Create or select an FDR record before attaching a document."); return; } const form = new FormData(); form.append("file", file); setProcessing(true); setMessage("Uploading document and running OCR…"); try { const result = await request<{ id: number; sha256: string }>(`/api/fdrs/${target}/documents`, { method: "POST", body: form }); const extraction = await request<{ id: number; document_id: number; provider: string; text: string; page_count: number; authenticity_confirmed: boolean }>(`/api/documents/${result.id}/extract`, { method: "POST" }); setExtracted(extraction); setMessage(`Document analyzed with ${extraction.provider}. Candidate fields are ready for review.`); setSelected(target); } catch (e) { setMessage(""); setError((e as Error).message); } finally { setProcessing(false); } };
+  const chooseFile = (candidate: File | null) => { if (!candidate) return; if (candidate.size > 10 * 1024 * 1024) { setError("The document must be smaller than 10 MB."); return; } setFile(candidate); setMessage(""); setExtracted(null); setWorkflowStage(null); };
+  const analyze = async () => { if (!file) { setError("Choose an FDR document first."); return; } const target = selected || fdrs[0]?.id?.toString(); if (!target) { setError("Create or select an FDR record before attaching a document."); return; } const form = new FormData(); form.append("file", file); setProcessing(true); setWorkflowStage("upload"); setMessage(""); try { const result = await request<{ id: number; sha256: string }>(`/api/fdrs/${target}/documents`, { method: "POST", body: form }); setWorkflowStage("extract"); const extraction = await request<{ id: number; document_id: number; provider: string; text: string; page_count: number; authenticity_confirmed: boolean }>(`/api/documents/${result.id}/extract`, { method: "POST" }); setExtracted(extraction); setMessage(`Document analyzed with ${extraction.provider}. Candidate fields are ready for review.`); setSelected(target); } catch (e) { setMessage(""); setError((e as Error).message); } finally { setProcessing(false); setWorkflowStage(null); } };
   const onDrop = (event: DragEvent<HTMLLabelElement>) => { event.preventDefault(); chooseFile(event.dataTransfer.files[0] || null); };
-  const convertToDraft = async () => { if (!extracted) return; setProcessing(true); setMessage("Converting extraction into FDR form fields…"); try { const result = await request<{ fields: FdrDraftValues }>(`/api/documents/${extracted.document_id}/convert-to-fdr-draft?fdr_id=${encodeURIComponent(selected || "")}`, { method: "POST" }); setDraftValues(result.fields); setShowRegistration(true); setMessage("Candidate fields loaded into the FDR master-record form. Review them before submitting."); } catch (e) { setError((e as Error).message); } finally { setProcessing(false); } };
-  return <><PageHeader eyebrow="MAIN WORKFLOW / INTAKE" title="Upload & Analyze FDR" description="Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft." /><div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div><section className="analyze-layout"><div className="panel analyze-card"><div className="eyebrow">AUTO OCR</div><h2>Upload your FDR document</h2><p>Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository.</p><label className="analyze-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><input type="file" accept=".pdf,.png,.jpg,.jpeg" onChange={(e) => chooseFile(e.target.files?.[0] || null)} /><Icon name="upload" size={28} /><b>{file ? file.name : "Drag and drop your FDR document here, or"}</b><button type="button" className="button primary">Choose FDR document</button><small>Supported formats: JPG, JPEG, PNG, PDF · Max size: 10 MB</small></label><label className="select-label">Attach to existing FDR record (optional)<select value={selected} onChange={(e) => setSelected(e.target.value)}><option value="">Use first available record</option>{fdrs.map((row) => <option value={row.id} key={row.id}>{row.identifier} · {row.holder_name}</option>)}</select></label><button className="button primary wide" disabled={processing} onClick={analyze}><Icon name="upload" size={16} />{processing ? "Uploading and processing…" : "Analyze document"}</button>{message && <div className="success-message"><Icon name={processing ? "clock" : "check"} size={15} />{message}</div>}</div><div className="panel analyze-guidance"><div className="eyebrow">CONVERSION FLOW</div><h2>Manual document → FDR repository</h2><div className="conversion-steps"><div><i>1</i><span><b>Upload</b><small>Store the original and SHA-256 fingerprint</small></span></div><div><i>2</i><span><b>Extract</b><small>Run PyMuPDF or Tesseract OCR</small></span></div><div><i>3</i><span><b>Review</b><small>Check candidate fields against the document</small></span></div><div><i>4</i><span><b>Register</b><small>Submit a draft into the FDR master records</small></span></div></div><button className="button secondary wide" onClick={() => setPage("registry")}>Open FDR master records <Icon name="arrow" size={16} /></button></div></section>{extracted && <section className="panel extraction-review"><div><div className="eyebrow">EXTRACTION RESULT</div><h2>Review candidate data before registration</h2><p>{extracted.provider} · {extracted.page_count} page(s) · {extracted.text.length} characters · authenticity unconfirmed</p></div><div className="extracted-text">{extracted.text || "No text was detected. Use the original document and enter values manually."}</div><div className="form-actions"><button className="button ghost" onClick={() => setExtracted(null)}>Discard result</button><button className="button primary" disabled={processing} onClick={convertToDraft}>{processing ? "Converting…" : "Convert to FDR master-record draft"} <Icon name="arrow" size={16} /></button></div></section>}{showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => setShowRegistration(false)} onSaved={(result) => { setShowRegistration(false); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}</>;
+  const convertToDraft = async () => { if (!extracted) return; setProcessing(true); setWorkflowStage("register"); setMessage(""); try { const result = await request<{ fields: FdrDraftValues }>(`/api/documents/${extracted.document_id}/convert-to-fdr-draft?fdr_id=${encodeURIComponent(selected || "")}`, { method: "POST" }); setDraftValues(result.fields); setShowRegistration(true); setMessage("Candidate fields loaded into the FDR master-record form. Review them before submitting."); } catch (e) { setError((e as Error).message); } finally { setProcessing(false); setWorkflowStage(null); } };
+  const workflowSteps = [
+    { key: "upload", label: "Upload document", detail: "Store the original file and fingerprint" },
+    { key: "extract", label: "Analyze document", detail: "Read text with the available OCR provider" },
+    { key: "review", label: "Review extracted data", detail: "Check candidate fields before registration" },
+    { key: "register", label: "Prepare FDR draft", detail: "Prepare candidate fields for review" },
+  ];
+  const currentWorkflowStep = workflowStage === "complete" ? workflowSteps.length : workflowSteps.findIndex((step) => step.key === workflowStage);
+  const workflowStatus = workflowStage === "upload"
+    ? "Uploading document…"
+    : workflowStage === "extract"
+      ? "Analyzing document…"
+      : workflowStage === "review"
+        ? "Review extracted data…"
+        : workflowStage === "register"
+          ? "Preparing FDR draft…"
+          : "Processing complete.";
+  return <><PageHeader eyebrow="MAIN WORKFLOW / INTAKE" title="Upload & Analyze FDR" description="Upload a fixed deposit receipt and convert its document evidence into a reviewable FDR master-record draft." /><div className="local-demo-banner"><Icon name="shield" size={16} /><b>Local processing & privacy assurance</b><span>OCR and text parsing run through the configured local provider. Authenticity and bank confirmation still require review.</span></div><section className="analyze-layout"><div className="panel analyze-card"><div className="eyebrow">AUTO OCR</div><h2>Upload your FDR document</h2><p>Upload a Fixed Deposit Receipt or Security Deposit document. The system extracts candidate financial terms and validates the input before it enters the FDR repository.</p><label className="analyze-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><input type="file" accept=".pdf,.png,.jpg,.jpeg" onChange={(e) => chooseFile(e.target.files?.[0] || null)} /><Icon name="upload" size={28} /><b>{file ? file.name : "Drag and drop your FDR document here, or"}</b><button type="button" className="button primary">Choose FDR document</button><small>Supported formats: JPG, JPEG, PNG, PDF · Max size: 10 MB</small></label><label className="select-label">Attach to existing FDR record (optional)<select value={selected} onChange={(e) => setSelected(e.target.value)}><option value="">Use first available record</option>{fdrs.map((row) => <option value={row.id} key={row.id}>{row.identifier} · {row.holder_name}</option>)}</select></label><button className="button primary wide" disabled={processing} onClick={analyze}><Icon name="upload" size={16} />{processing ? "Uploading and processing…" : "Analyze document"}</button>{workflowStage && <div className="analysis-progress" role="status" aria-live="polite" aria-busy={processing}><div className="analysis-progress-heading">{processing && <span className="analysis-progress-spinner" aria-hidden="true" />}<div><b>{workflowStatus}</b><small>OCR results are suggestions and do not verify authenticity.</small></div></div><ol className="analysis-progress-steps">{workflowSteps.map((step, index) => { const complete = index < currentWorkflowStep; const current = index === currentWorkflowStep && workflowStage !== "complete"; return <li key={step.key} className={complete ? "is-complete" : current ? "is-current" : ""} aria-current={current ? "step" : undefined}><span className="analysis-progress-number">{complete ? <Icon name="check" size={13} /> : index + 1}</span><div><b>{step.label}</b><small>{step.detail}</small></div></li>; })}</ol></div>}{message && <div className="success-message"><Icon name={processing ? "clock" : "check"} size={15} />{message}</div>}</div><div className="panel analyze-guidance"><div className="eyebrow">CONVERSION FLOW</div><h2>Manual document → FDR repository</h2><div className="conversion-steps"><div><i>1</i><span><b>Upload</b><small>Store the original and SHA-256 fingerprint</small></span></div><div><i>2</i><span><b>Extract</b><small>Run PyMuPDF or Tesseract OCR</small></span></div><div><i>3</i><span><b>Review</b><small>Check candidate fields against the document</small></span></div><div><i>4</i><span><b>Register</b><small>Submit a draft into the FDR master records</small></span></div></div><button className="button secondary wide" onClick={() => setPage("registry")}>Open FDR master records <Icon name="arrow" size={16} /></button></div></section>{extracted && <section className="panel extraction-review"><div><div className="eyebrow">EXTRACTION RESULT</div><h2>Review candidate data before registration</h2><p>{extracted.provider} · {extracted.page_count} page(s) · {extracted.text.length} characters · authenticity unconfirmed</p></div><div className="extracted-text">{extracted.text || "No text was detected. Use the original document and enter values manually."}</div><div className="form-actions"><button className="button ghost" onClick={() => { setExtracted(null); setWorkflowStage(null); }}>Discard result</button><button className="button primary" disabled={processing} onClick={convertToDraft}>{processing ? "Converting…" : "Convert to FDR master-record draft"} <Icon name="arrow" size={16} /></button></div></section>}{showRegistration && <FdrForm institutions={institutions} initialValues={draftValues} sourceDocumentId={extracted?.document_id} onClose={() => { setShowRegistration(false); setWorkflowStage("review"); }} onSaved={(result) => { setShowRegistration(false); setWorkflowStage("complete"); setMessage(result ? `Submitted as incomplete intake draft #${result.intake_id}; it is saved for review.` : "FDR draft created in the master records."); if (!result) setPage("registry"); }} setError={setError} />}</>;
 }
 
 function Discrepancies({ setError, initialFdrId, onSelectFdr, role }: { setError: (s: string) => void; initialFdrId: number | null; onSelectFdr: (id: number | null) => void; role: string }) {
@@ -1575,7 +1721,7 @@ function PolicyForm({ onClose, onSaved, setError }: { onClose: () => void; onSav
 
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) { return <div className="modal-backdrop" role="dialog" aria-modal="true"><div className="modal"><div className="modal-heading"><div><div className="eyebrow">VAULTTRACE WORKSPACE</div><h2>{title}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close"><Icon name="close" /></button></div>{children}</div></div>; }
 function TableHeader({ title, subtitle }: { title: string; subtitle: string }) { return <div className="panel-heading"><div><h2>{title}</h2><p>{subtitle}</p></div><button className="icon-button"><Icon name="settings" size={17} /></button></div>; }
-function FdrTable({ rows, institutions = [], emptyText = "No FDR records have been registered yet." }: { rows: Fdr[]; institutions?: Institution[]; emptyText?: string }) { const institutionName = (id: number) => institutions.find((item) => item.id === id)?.name || `Institution #${id}`; return <table><thead><tr><th>FDR record</th><th>Institution</th><th>Amount</th><th>Maturity</th><th>Status</th><th /></tr></thead><tbody>{rows.length ? rows.map((row) => <tr key={row.id}><td><b>{row.identifier}</b><small className="table-sub">{row.holder_name}</small></td><td>{institutionName(row.institution_id)}</td><td>{formatAmount(row.amount)}</td><td>{new Date(row.maturity_date).toLocaleDateString("en-IN")}</td><td><StatusBadge value={row.status} /></td><td className="align-right"><button className="row-action">Open <Icon name="arrow" size={14} /></button></td></tr>) : <tr><td colSpan={6}><EmptyState text={emptyText} /></td></tr>}</tbody></table>; }
+function FdrTable({ rows, institutions = [], emptyText = "No FDR records have been registered yet.", onOpen }: { rows: Fdr[]; institutions?: Institution[]; emptyText?: string; onOpen: (id: number) => void }) { const institutionName = (id: number) => institutions.find((item) => item.id === id)?.name || `Institution #${id}`; return <table><thead><tr><th>FDR record</th><th>Institution</th><th>Amount</th><th>Maturity</th><th>Status</th><th /></tr></thead><tbody>{rows.length ? rows.map((row) => <tr key={row.id}><td><b>{row.identifier}</b><small className="table-sub">{row.holder_name}</small></td><td>{institutionName(row.institution_id)}</td><td>{formatAmount(row.amount)}</td><td>{new Date(row.maturity_date).toLocaleDateString("en-IN")}</td><td><StatusBadge value={row.status} /></td><td className="align-right"><button className="row-action" onClick={() => onOpen(row.id)}>Open <Icon name="arrow" size={14} /></button></td></tr>) : <tr><td colSpan={6}><EmptyState text={emptyText} /></td></tr>}</tbody></table>; }
 function EmptyState({ text }: { text: string }) { return <div className="empty-state"><div className="empty-icon"><Icon name="file" size={20} /></div><span>{text}</span></div>; }
 function LoadingRows({ cols }: { cols: number }) { return <>{[1, 2, 3].map((row) => <tr key={row}>{Array.from({ length: cols }).map((_, index) => <td key={index}><div className="skeleton" /></td>)}</tr>)}</>; }
 

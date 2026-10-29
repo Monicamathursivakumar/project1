@@ -60,8 +60,8 @@ def seed_scenarios() -> int:
         ]
         fdrs: list[Fdr] = []
         for index, (identifier, institution, amount, status, days, bank, notes) in enumerate(scenarios):
-            issue = now - timedelta(days=120)
             maturity = now + timedelta(days=days)
+            issue = maturity - timedelta(days=365)
             fdr = Fdr(
                 identifier=identifier,
                 institution_id=institution.id,

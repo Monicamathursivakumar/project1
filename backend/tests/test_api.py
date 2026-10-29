@@ -806,6 +806,61 @@ def test_aggregate_views_are_scoped_to_membership():
     assert directory.json()["institutions"] == 1
 
 
+def test_dashboard_recent_uploads_are_ordered_and_scoped():
+    suffix = uuid.uuid4().hex[:8]
+    username = f"upload-officer-{suffix}"
+    with SessionLocal() as db:
+        officer = User(username=username, password_hash=pwd_context.hash("UploadPass123!"), role=Role.officer)
+        assigned = Institution(name=f"Upload Academy {suffix}", code=f"UPLOAD-A-{suffix}")
+        hidden = Institution(name=f"Upload Hidden {suffix}", code=f"UPLOAD-B-{suffix}")
+        db.add_all([officer, assigned, hidden])
+        db.flush()
+        db.add(UserInstitutionMembership(user_id=officer.id, institution_id=assigned.id))
+        fdrs = [
+            Fdr(identifier=f"FDR-UPLOAD-A-{suffix}", institution_id=assigned.id, holder_name="Assigned", amount=100,
+                maturity_date=datetime(2027, 1, 1, tzinfo=timezone.utc), created_by=officer.id),
+            Fdr(identifier=f"FDR-UPLOAD-B-{suffix}", institution_id=hidden.id, holder_name="Hidden", amount=200,
+                maturity_date=datetime(2027, 1, 1, tzinfo=timezone.utc), created_by=officer.id),
+        ]
+        db.add_all(fdrs)
+        db.flush()
+        db.add_all([
+            Document(fdr_id=fdrs[0].id, original_name="older.pdf", stored_name=f"older-{suffix}.pdf",
+                     sha256=f"{suffix}a".ljust(64, "0"), content_type="application/pdf", size=1024,
+                     created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            Document(fdr_id=fdrs[1].id, original_name="hidden.pdf", stored_name=f"hidden-{suffix}.pdf",
+                     sha256=f"{suffix}b".ljust(64, "0"), content_type="application/pdf", size=2048,
+                     created_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+            Document(fdr_id=fdrs[0].id, original_name="latest.pdf", stored_name=f"latest-{suffix}.pdf",
+                     sha256=f"{suffix}c".ljust(64, "0"), content_type="application/pdf", size=3072,
+                     created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        ])
+        db.commit()
+
+    token = client.post("/api/auth/token", data={"username": username, "password": "UploadPass123!"})
+    assert token.status_code == 200
+    scoped_headers = {"Authorization": f"Bearer {token.json()['access_token']}"}
+    uploads = client.get("/api/dashboard/recent-uploads?limit=1", headers=scoped_headers)
+    assert uploads.status_code == 200
+    assert [upload["original_name"] for upload in uploads.json()] == ["latest.pdf"]
+    assert uploads.json()[0]["identifier"] == f"FDR-UPLOAD-A-{suffix}"
+    assert uploads.json()[0]["status"] == "draft"
+
+
+def test_public_demo_blocks_writes_but_allows_login_route(monkeypatch):
+    monkeypatch.setattr(main.settings, "public_demo_mode", True)
+
+    blocked = client.post("/api/fdrs", json={})
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == "This public demo is read-only."
+    assert client.get("/api/auth/github/start?registration_id=demo").status_code == 403
+    assert client.get("/api/auth/github/callback?state=demo").status_code == 403
+    assert client.head("/api/auth/github/start?registration_id=demo").status_code == 403
+
+    login = client.post("/api/auth/token", data={"username": "not-a-demo-user", "password": "invalid"})
+    assert login.status_code == 401
+
+
 def test_terminal_verification_requires_evidence_reference():
     headers = auth_headers()
     suffix = uuid.uuid4().hex[:8]

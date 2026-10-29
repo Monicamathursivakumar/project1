@@ -18,8 +18,8 @@ import pytesseract
 from PIL import Image, ImageOps
 from email.message import EmailMessage
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     bootstrap_token: str | None = None
     initial_admin_password: str | None = None
     app_environment: str = "development"
+    public_demo_mode: bool = False
     frontend_base_url: str = "http://localhost:5173"
     email_verification_base_url: str | None = None
     smtp_host: str | None = None
@@ -428,6 +429,17 @@ class DocumentOut(BaseModel):
     created_at: datetime
 
 
+class RecentUploadOut(BaseModel):
+    id: int
+    fdr_id: int
+    identifier: str
+    original_name: str
+    content_type: str
+    size: int
+    created_at: datetime
+    status: FdrStatus
+
+
 class InstrumentVersion(Base):
     __tablename__ = "instrument_versions"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -570,6 +582,38 @@ allowed_origins = [
     if (origin := value.strip().rstrip("/"))
 ]
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def restrict_public_demo_writes(request: Request, call_next):
+    state_changing_get_routes = {
+        "/api/auth/github/start",
+        "/api/auth/github/callback",
+    }
+    if (
+        settings.public_demo_mode
+        and (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request.url.path != "/api/auth/token"
+            or request.method in {"GET", "HEAD"}
+            and request.url.path in state_changing_get_routes
+        )
+    ):
+        return JSONResponse(status_code=403, content={"detail": "This public demo is read-only."})
+    return await call_next(request)
+
+
+def initialize_public_demo() -> None:
+    if not settings.public_demo_mode:
+        return
+    if settings.app_environment.casefold() != "demo":
+        raise RuntimeError("PUBLIC_DEMO_MODE requires APP_ENVIRONMENT=demo.")
+    from .seed_public_demo import seed_public_demo
+
+    seed_public_demo()
+
+
+app.add_event_handler("startup", initialize_public_demo)
 
 
 def db_session() -> Generator[Session, None, None]:
@@ -2055,6 +2099,34 @@ def list_fdrs(db: Db, user: Annotated[User, Depends(current_user)], q: str = "")
     if user.role not in {Role.admin, Role.auditor}:
         query = query.join(UserInstitutionMembership, UserInstitutionMembership.institution_id == Fdr.institution_id).where(UserInstitutionMembership.user_id == user.id)
     return db.scalars(query.order_by(Fdr.id.desc())).all()
+
+
+@app.get("/api/dashboard/recent-uploads", response_model=list[RecentUploadOut])
+def dashboard_recent_uploads(
+    db: Db,
+    user: Annotated[User, Depends(current_user)],
+    limit: int = Query(default=5, ge=1, le=20),
+):
+    query = select(Document, Fdr).join(Fdr, Fdr.id == Document.fdr_id)
+    if user.role not in {Role.admin, Role.auditor}:
+        query = query.join(
+            UserInstitutionMembership,
+            UserInstitutionMembership.institution_id == Fdr.institution_id,
+        ).where(UserInstitutionMembership.user_id == user.id)
+    rows = db.execute(query.order_by(Document.created_at.desc(), Document.id.desc()).limit(limit)).all()
+    return [
+        {
+            "id": document.id,
+            "fdr_id": fdr.id,
+            "identifier": fdr.identifier,
+            "original_name": document.original_name,
+            "content_type": document.content_type,
+            "size": document.size,
+            "created_at": document.created_at,
+            "status": fdr.status,
+        }
+        for document, fdr in rows
+    ]
 
 
 @app.get("/api/fdr-intakes", response_model=list[FdrIntakeOut])
