@@ -312,7 +312,6 @@ function App() {
       <div className="app-content">
         <Topbar user={user} onSearch={() => setPage("registry")} />
         <main className="content-wrap">
-          {publicDemoMode && <div className="public-demo-banner" role="note"><Icon name="shield" size={16} /><span><b>Shared writable demo</b> Changes are visible to other visitors. Seeded records are synthetic; use synthetic documents only. Uploaded files may be lost after a restart.</span></div>}
           <div className="breadcrumbs"><span>VaultTrace</span><b>/</b><strong>{navItems.find((item) => item.id === page)?.label}</strong></div>
           {error && <div className="toast error-toast"><Icon name="alert" size={16} />{error}<button onClick={() => setError("")}><Icon name="close" size={15} /></button></div>}
           <PageContent page={page} setPage={setPage} setError={setError} role={user.role} selectedInstrument={selectedInstrument} selectedDiscrepancyFdrId={selectedDiscrepancyFdrId} openDiscrepancy={openDiscrepancy} selectDiscrepancyInstrument={selectDiscrepancyInstrument} openInstrument={(id) => { setSelectedInstrument(id); setPage("instrument-detail"); }} />
@@ -635,7 +634,7 @@ function Login({ onLogin, onBackHome, publicDemo }: { onLogin: (user: User) => v
               <span className="demo-role-action">{loading ? "Opening…" : "Sign in"}<Icon name="arrow" size={14} /></span>
             </button>)}
           </div>
-          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>. Hosted changes are shared. Use synthetic data only; uploaded files are temporary and can disappear.</p>
+          <p className="demo-password-note">{publicDemo ? "Shared public demo password" : "Shared demo password"} <code>{demoPassword}</code>.</p>
         </section>}
       </>}
       {mode === "register" && <RegistrationWizard onComplete={(id, email, message) => {
