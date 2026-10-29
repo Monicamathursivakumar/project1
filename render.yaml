@@ -38,10 +38,7 @@ services:
     staticPublishPath: ./dist
     envVars:
       - key: VITE_API_URL
-        fromService:
-          type: web
-          name: vaulttrace-api
-          property: host
+        value: https://vaulttrace-api.onrender.com
       - key: NODE_VERSION
         value: 24.22.1
       - key: VITE_PUBLIC_DEMO
